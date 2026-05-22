@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import string
+import threading
 import uuid
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ from django.contrib.auth import get_user_model, authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.core.files.storage import FileSystemStorage
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -27,7 +29,15 @@ from django.core import signing
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
-from .football_data import fetch_pl_matches, fetch_pl_scorers
+from .football_data import (
+    canonical_team_name,
+    fetch_match,
+    fetch_pl_matches,
+    fetch_pl_result_stats,
+    fetch_pl_scorers,
+    fetch_thesportsdb_event_stats,
+)
+from .email_templates import fantasy_notification_email
 from .models import AdminMatch, AdminProfile, TransferRecord, UserTeam, Player
 from .serializers import EmailTokenObtainPairSerializer, RegisterSerializer
 
@@ -235,6 +245,10 @@ def _match_has_eligible_points(
 
 def _reconcile_team_points(team, finished_matches=None):
     finished_matches = finished_matches or fetch_pl_matches(limit=500, status='FINISHED')
+    if not finished_matches:
+        logger.warning("Skipping point reconciliation for user %s because finished match data is unavailable.", team.user_id)
+        return int(team.points or 0)
+
     match_index = {
         str(match.get('id')): match
         for match in finished_matches
@@ -461,6 +475,8 @@ def _match_payload(match):
             for referee in (match.get('referees') or [])
             if referee.get('name')
         ],
+        'events': _match_events(match),
+        'stats': _extract_match_stats(match),
     }
 
 
@@ -503,6 +519,704 @@ def _difficulty_for_match(match):
 def _is_attacker_position(position):
     value = (position or '').lower()
     return any(token in value for token in ('offence', 'forward', 'attacker', 'striker', 'winger'))
+
+
+def _safe_number(value):
+    if value in ('', None):
+        return None
+    try:
+        return float(str(value).replace('%', '').strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value):
+    number = _safe_number(value)
+    return int(number) if number is not None else None
+
+
+def _normalize_stat_name(name):
+    return ''.join(ch for ch in str(name or '').lower() if ch.isalnum())
+
+
+STAT_ALIASES = {
+    'goals': {'goals', 'fulltimegoals'},
+    'half_time_goals': {'halftimegoals'},
+    'shots': {'totalshots', 'shots', 'shotstotal'},
+    'shots_on_target': {'shotsontarget', 'shotsongoal', 'ontarget', 'shotson'},
+    'shots_off_target': {'shotsofftarget', 'shotsoffgoal'},
+    'possession': {'possession', 'ballpossession'},
+    'pass_accuracy': {'passaccuracy', 'passesaccuracy', 'accuratepassespercentage'},
+    'passes': {'passes', 'totalpasses'},
+    'fouls': {'fouls', 'foulscommitted'},
+    'yellow_cards': {'yellowcards', 'yellowcard'},
+    'yellow_red_cards': {'yellowredcards', 'secondyellowcards'},
+    'red_cards': {'redcards', 'redcard'},
+    'offsides': {'offsides', 'offside'},
+    'corners': {'corners', 'cornerkicks'},
+    'free_kicks': {'freekicks'},
+    'goal_kicks': {'goalkicks'},
+    'throw_ins': {'throwins'},
+    'saves': {'saves', 'goalkeepersaves', 'keepersaves'},
+    'xg': {'xg', 'expectedgoals'},
+    'big_chances': {'bigchances', 'bigchancescreated'},
+}
+
+
+def _empty_team_stats():
+    return {key: None for key in STAT_ALIASES.keys()}
+
+
+def _set_stat(stats, side, raw_name, raw_value):
+    normalized = _normalize_stat_name(raw_name)
+    for key, aliases in STAT_ALIASES.items():
+        if normalized in aliases:
+            stats[side][key] = _safe_number(raw_value)
+            return
+
+
+def _first_present(item, *keys):
+    for key in keys:
+        if key in item and item.get(key) is not None:
+            return item.get(key)
+    return None
+
+
+def _extract_match_stats(match):
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+
+    home_stats = (
+        match.get('homeStatistics')
+        or match.get('home_stats')
+        or (match.get('homeTeam') or {}).get('statistics')
+        or {}
+    )
+    away_stats = (
+        match.get('awayStatistics')
+        or match.get('away_stats')
+        or (match.get('awayTeam') or {}).get('statistics')
+        or {}
+    )
+    if isinstance(home_stats, dict) or isinstance(away_stats, dict):
+        for key, value in (home_stats or {}).items():
+            _set_stat(stats, 'home', key, value)
+        for key, value in (away_stats or {}).items():
+            _set_stat(stats, 'away', key, value)
+
+    raw_statistics = match.get('statistics') or match.get('stats') or []
+    if isinstance(raw_statistics, dict):
+        for key, value in raw_statistics.items():
+            if isinstance(value, dict):
+                _set_stat(stats, 'home', key, value.get('home'))
+                _set_stat(stats, 'away', key, value.get('away'))
+    elif isinstance(raw_statistics, list):
+        for item in raw_statistics:
+            if not isinstance(item, dict):
+                continue
+            raw_name = item.get('type') or item.get('name') or item.get('stat') or item.get('key')
+            home_value = _first_present(item, 'home', 'homeValue', 'home_team')
+            away_value = _first_present(item, 'away', 'awayValue', 'away_team')
+            if home_value is not None or away_value is not None:
+                _set_stat(stats, 'home', raw_name, home_value)
+                _set_stat(stats, 'away', raw_name, away_value)
+
+            team_side = str(item.get('team') or item.get('side') or '').lower()
+            value = item.get('value')
+            if value is not None and team_side in ('home', 'away'):
+                _set_stat(stats, team_side, raw_name, value)
+
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['unavailable_fields'] = [
+        key
+        for key in ('pass_accuracy', 'passes', 'xg', 'big_chances')
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    stats['message'] = (
+        'Detailed provider statistics loaded for this match.'
+        if stats['available']
+        else 'The provider has not published advanced statistics for this fixture yet.'
+    )
+    return stats
+
+
+def _parse_result_date(value):
+    for fmt in ('%d/%m/%Y', '%d/%m/%y'):
+        try:
+            return datetime.strptime(str(value), fmt).date()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _match_result_stats_row(match, rows):
+    home_name = canonical_team_name((match.get('homeTeam') or {}).get('shortName') or (match.get('homeTeam') or {}).get('name'))
+    away_name = canonical_team_name((match.get('awayTeam') or {}).get('shortName') or (match.get('awayTeam') or {}).get('name'))
+    kickoff = _match_kickoff(match)
+    match_date = kickoff.date() if kickoff else None
+    score = (match.get('score') or {}).get('fullTime') or {}
+    home_goals = score.get('home')
+    away_goals = score.get('away')
+
+    best_candidate = None
+    best_distance = 99
+    for row in rows:
+        row_home = canonical_team_name(row.get('HomeTeam'))
+        row_away = canonical_team_name(row.get('AwayTeam'))
+        if row_home != home_name or row_away != away_name:
+            continue
+
+        if home_goals is not None and _safe_int(row.get('FTHG')) != int(home_goals):
+            continue
+        if away_goals is not None and _safe_int(row.get('FTAG')) != int(away_goals):
+            continue
+
+        row_date = _parse_result_date(row.get('Date'))
+        if match_date and row_date:
+            distance = abs((row_date - match_date).days)
+            if distance > 3:
+                continue
+        else:
+            distance = 0
+
+        if distance < best_distance:
+            best_candidate = row
+            best_distance = distance
+
+    return best_candidate
+
+
+def _stats_from_result_row(row):
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+    mapping = {
+        'shots': ('HS', 'AS'),
+        'shots_on_target': ('HST', 'AST'),
+        'fouls': ('HF', 'AF'),
+        'corners': ('HC', 'AC'),
+        'yellow_cards': ('HY', 'AY'),
+        'red_cards': ('HR', 'AR'),
+    }
+    for key, (home_col, away_col) in mapping.items():
+        stats['home'][key] = _safe_number(row.get(home_col))
+        stats['away'][key] = _safe_number(row.get(away_col))
+
+    for side in ('home', 'away'):
+        shots = stats[side].get('shots')
+        shots_on_target = stats[side].get('shots_on_target')
+        if shots is not None and shots_on_target is not None:
+            stats[side]['shots_off_target'] = max(0, shots - shots_on_target)
+
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['source'] = 'football-data.co.uk'
+    stats['message'] = 'Match statistics loaded from football-data.co.uk results data.'
+    stats['unavailable_fields'] = [
+        key
+        for key in ('possession', 'pass_accuracy', 'passes', 'offsides', 'saves', 'xg', 'big_chances')
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    return stats
+
+
+def _team_form_rows(rows, team_name, before_date=None, limit=8):
+    canonical = canonical_team_name(team_name)
+    matches = []
+    for row in rows:
+        row_date = _parse_result_date(row.get('Date'))
+        if before_date and row_date and row_date > before_date:
+            continue
+        if canonical_team_name(row.get('HomeTeam')) == canonical:
+            matches.append((row_date, row, 'home'))
+        elif canonical_team_name(row.get('AwayTeam')) == canonical:
+            matches.append((row_date, row, 'away'))
+
+    matches.sort(key=lambda item: item[0] or datetime.min.date(), reverse=True)
+    return matches[:limit]
+
+
+def _average(values):
+    cleaned = [value for value in values if value is not None]
+    if not cleaned:
+        return None
+    return round(sum(cleaned) / len(cleaned), 1)
+
+
+def _team_form_metrics(team_rows):
+    values = {
+        'goals': [],
+        'shots': [],
+        'shots_on_target': [],
+        'fouls': [],
+        'corners': [],
+        'yellow_cards': [],
+        'red_cards': [],
+    }
+    for _, row, side in team_rows:
+        home = side == 'home'
+        values['goals'].append(_safe_number(row.get('FTHG' if home else 'FTAG')))
+        values['shots'].append(_safe_number(row.get('HS' if home else 'AS')))
+        values['shots_on_target'].append(_safe_number(row.get('HST' if home else 'AST')))
+        values['fouls'].append(_safe_number(row.get('HF' if home else 'AF')))
+        values['corners'].append(_safe_number(row.get('HC' if home else 'AC')))
+        values['yellow_cards'].append(_safe_number(row.get('HY' if home else 'AY')))
+        values['red_cards'].append(_safe_number(row.get('HR' if home else 'AR')))
+
+    metrics = {key: _average(metric_values) for key, metric_values in values.items()}
+    shots = metrics.get('shots')
+    shots_on_target = metrics.get('shots_on_target')
+    if shots is not None and shots_on_target is not None:
+        metrics['shots_off_target'] = round(max(0, shots - shots_on_target), 1)
+    return metrics
+
+
+def _team_form_stats_from_rows(match, rows):
+    home = match.get('homeTeam') or {}
+    away = match.get('awayTeam') or {}
+    kickoff = _match_kickoff(match)
+    before_date = kickoff.date() if kickoff else None
+    home_rows = _team_form_rows(rows, home.get('name') or home.get('shortName'), before_date=before_date)
+    away_rows = _team_form_rows(rows, away.get('name') or away.get('shortName'), before_date=before_date)
+
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+    stats['home'].update(_team_form_metrics(home_rows))
+    stats['away'].update(_team_form_metrics(away_rows))
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['source'] = 'team-form-history'
+    stats['message'] = 'Showing recent team-form averages from historical Premier League match data.'
+    stats['sample_size'] = {
+        'home': len(home_rows),
+        'away': len(away_rows),
+    }
+    stats['unavailable_fields'] = [
+        key
+        for key in STAT_ALIASES.keys()
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    return stats
+
+
+def _stats_from_thesportsdb(data):
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+    rows = data.get('eventstats') or data.get('stats') or data.get('event_stats') or []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        label = (
+            row.get('strStat')
+            or row.get('strStatistic')
+            or row.get('stat')
+            or row.get('name')
+            or row.get('type')
+        )
+        home_value = _first_present(row, 'intHome', 'home', 'homeValue', 'strHome')
+        away_value = _first_present(row, 'intAway', 'away', 'awayValue', 'strAway')
+        _set_stat(stats, 'home', label, home_value)
+        _set_stat(stats, 'away', label, away_value)
+
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['source'] = 'TheSportsDB'
+    stats['message'] = 'Match statistics loaded from TheSportsDB.'
+    stats['unavailable_fields'] = [
+        key
+        for key in STAT_ALIASES.keys()
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    return stats
+
+
+def _basic_match_insight_stats(match):
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+    score = (match.get('score') or {})
+    full_time = score.get('fullTime') or {}
+    half_time = score.get('halfTime') or {}
+    stats['home']['goals'] = _safe_number(full_time.get('home'))
+    stats['away']['goals'] = _safe_number(full_time.get('away'))
+    stats['home']['half_time_goals'] = _safe_number(half_time.get('home'))
+    stats['away']['half_time_goals'] = _safe_number(half_time.get('away'))
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['source'] = 'match-score'
+    stats['message'] = 'Showing basic match insights while advanced provider statistics are unavailable.'
+    stats['unavailable_fields'] = [
+        key
+        for key in STAT_ALIASES.keys()
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    return stats
+
+
+def _merge_stats(primary, fallback):
+    if not fallback or not fallback.get('available'):
+        return primary
+    merged = {
+        'home': dict(primary.get('home') or _empty_team_stats()),
+        'away': dict(primary.get('away') or _empty_team_stats()),
+        'available': primary.get('available') or fallback.get('available'),
+        'source': primary.get('source') or fallback.get('source'),
+        'message': primary.get('message') if primary.get('available') else fallback.get('message'),
+    }
+    sources = []
+    if primary.get('available'):
+        sources.append(primary.get('source') or 'football-data.org')
+    if fallback.get('available'):
+        sources.append(fallback.get('source') or 'football-data.co.uk')
+    merged['sources'] = sorted(set(filter(Boolean, sources)))
+
+    for side in ('home', 'away'):
+        for key, value in (fallback.get(side) or {}).items():
+            if merged[side].get(key) is None and value is not None:
+                merged[side][key] = value
+
+    merged['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in merged[side].values()
+    )
+    merged['unavailable_fields'] = [
+        key
+        for key in STAT_ALIASES.keys()
+        if merged['home'].get(key) is None and merged['away'].get(key) is None
+    ]
+    return merged
+
+
+def _stats_diagnostics(match, primary_meta=None, sportsdb_meta=None, fallback_meta=None, fallback_row=None):
+    home = match.get('homeTeam') or {}
+    away = match.get('awayTeam') or {}
+    primary_home_stats = home.get('statistics') or match.get('homeStatistics') or {}
+    primary_away_stats = away.get('statistics') or match.get('awayStatistics') or {}
+    return {
+        'fixture_id': match.get('id'),
+        'home_team': home.get('shortName') or home.get('name'),
+        'away_team': away.get('shortName') or away.get('name'),
+        'football_data_org': {
+            'request_url': (primary_meta or {}).get('url'),
+            'status': (primary_meta or {}).get('status'),
+            'cache_hit': (primary_meta or {}).get('cache_hit', False),
+            'payload_keys': (primary_meta or {}).get('payload_keys', []),
+            'payload_excerpt': (primary_meta or {}).get('payload_excerpt'),
+            'home_statistics_keys': list(primary_home_stats.keys()) if isinstance(primary_home_stats, dict) else [],
+            'away_statistics_keys': list(primary_away_stats.keys()) if isinstance(primary_away_stats, dict) else [],
+        },
+        'football_data_uk': {
+            'request_url': (fallback_meta or {}).get('url'),
+            'status': (fallback_meta or {}).get('status'),
+            'cache_hit': (fallback_meta or {}).get('cache_hit', False),
+            'row_count': (fallback_meta or {}).get('row_count'),
+            'matched_row': {
+                key: fallback_row.get(key)
+                for key in ('Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'HS', 'AS', 'HST', 'AST', 'HF', 'AF', 'HC', 'AC', 'HY', 'AY', 'HR', 'AR')
+                if fallback_row and key in fallback_row
+            } if fallback_row else None,
+        },
+        'thesportsdb': {
+            'event_search_url': ((sportsdb_meta or {}).get('event_search') or {}).get('url'),
+            'event_search_status': ((sportsdb_meta or {}).get('event_search') or {}).get('status'),
+            'stats_request_url': ((sportsdb_meta or {}).get('stats_request') or {}).get('url'),
+            'stats_request_status': ((sportsdb_meta or {}).get('stats_request') or {}).get('status'),
+            'matched_event': (sportsdb_meta or {}).get('matched_event'),
+        },
+    }
+
+
+def _match_events(match):
+    events = []
+    for goal in match.get('goals') or []:
+        team = goal.get('team') or {}
+        scorer = goal.get('scorer') or {}
+        assist = goal.get('assist') or {}
+        events.append({
+            'minute': goal.get('minute'),
+            'injury_time': goal.get('injuryTime'),
+            'type': 'goal',
+            'team': team.get('name'),
+            'player': scorer.get('name'),
+            'assist': assist.get('name'),
+            'label': 'Goal',
+        })
+
+    for booking in match.get('bookings') or []:
+        team = booking.get('team') or {}
+        player = booking.get('player') or {}
+        card = booking.get('card') or 'CARD'
+        events.append({
+            'minute': booking.get('minute'),
+            'injury_time': booking.get('injuryTime'),
+            'type': str(card).lower(),
+            'team': team.get('name'),
+            'player': player.get('name'),
+            'label': str(card).replace('_', ' ').title(),
+        })
+
+    return sorted(
+        events,
+        key=lambda item: (
+            item.get('minute') if item.get('minute') is not None else 999,
+            item.get('injury_time') if item.get('injury_time') is not None else 0,
+        ),
+    )
+
+
+def _score_for_team(match, team_api_id):
+    score = (match.get('score') or {}).get('fullTime') or {}
+    home_id = (match.get('homeTeam') or {}).get('id')
+    away_id = (match.get('awayTeam') or {}).get('id')
+    if team_api_id == home_id:
+        return score.get('home')
+    if team_api_id == away_id:
+        return score.get('away')
+    return None
+
+
+def _player_performance_from_match(player, match):
+    team_api_id = player.team_api_id
+    is_players_match = team_api_id in (
+        (match.get('homeTeam') or {}).get('id'),
+        (match.get('awayTeam') or {}).get('id'),
+    )
+    if not is_players_match:
+        return None
+
+    player_stats = None
+    for raw_player in match.get('players') or match.get('playerStats') or []:
+        if not isinstance(raw_player, dict):
+            continue
+        raw_id = raw_player.get('id') or raw_player.get('player_id') or raw_player.get('playerId')
+        raw_name = raw_player.get('name') or raw_player.get('player') or raw_player.get('player_name')
+        if str(raw_id) == str(player.player_api_id) or str(raw_name).lower() == player.name.lower():
+            player_stats = raw_player
+            break
+
+    stats_source = player_stats or {}
+    goals = _safe_number(stats_source.get('goals'))
+    if goals is None and player_stats:
+        goals = _safe_number(stats_source.get('numberOfGoals'))
+
+    # football-data.org usually does not expose per-player box scores on the free match endpoint.
+    return {
+        'match_id': match.get('id'),
+        'matchweek': match.get('matchday'),
+        'kickoff': match.get('utcDate'),
+        'opponent': (
+            (match.get('awayTeam') or {}).get('shortName') or (match.get('awayTeam') or {}).get('name')
+            if team_api_id == (match.get('homeTeam') or {}).get('id')
+            else (match.get('homeTeam') or {}).get('shortName') or (match.get('homeTeam') or {}).get('name')
+        ),
+        'team_goals': _score_for_team(match, team_api_id),
+        'goals': goals,
+        'assists': _safe_number(stats_source.get('assists')),
+        'passes_completed': _safe_number(stats_source.get('passes_completed') or stats_source.get('passesCompleted')),
+        'tackles': _safe_number(stats_source.get('tackles')),
+        'saves': _safe_number(stats_source.get('saves')),
+        'minutes': _safe_number(stats_source.get('minutes') or stats_source.get('minutesPlayed')),
+        'rating': _safe_number(stats_source.get('rating') or stats_source.get('score') or stats_source.get('performance_score')),
+        'data_available': bool(player_stats),
+    }
+
+
+def _recent_player_performance(player, finished_matches):
+    player_matches = []
+    for match in sorted(finished_matches, key=_match_sort_kickoff, reverse=True):
+        item = _player_performance_from_match(player, match)
+        if item:
+            player_matches.append(item)
+        if len(player_matches) == 5:
+            break
+    return player_matches
+
+
+def _watchlist_payload(team, finished_matches=None):
+    watchlist = [item for item in list(team.watchlist or []) if isinstance(item, dict)]
+    player_ids = [item.get('id') for item in watchlist if item.get('id') is not None]
+    player_lookup = {
+        str(player.player_api_id): player
+        for player in Player.objects.filter(player_api_id__in=player_ids)
+    }
+    finished_matches = finished_matches if finished_matches is not None else fetch_pl_matches(limit=500, status='FINISHED')
+
+    rows = []
+    for item in watchlist:
+        player = player_lookup.get(str(item.get('id')))
+        payload = _player_payload(player) if player else dict(item)
+        payload['recent_performance'] = _recent_player_performance(player, finished_matches) if player else []
+        payload['performance_available'] = any(
+            entry.get('data_available') for entry in payload['recent_performance']
+        )
+        rows.append(payload)
+    return rows
+
+
+def _notification_sort_key(item):
+    return _coerce_datetime(item.get('created_at')) or datetime.min.replace(tzinfo=dt_timezone.utc)
+
+
+def _send_notification_email(team_id, notification_id, recipient_email):
+    try:
+        team = UserTeam.objects.select_related('user').get(pk=team_id)
+        notification = next(
+            (item for item in list(team.notifications or []) if str(item.get('id')) == str(notification_id)),
+            None,
+        )
+        if not notification or notification.get('email_sent') or not recipient_email:
+            return
+        subject, body = fantasy_notification_email(notification, team.user)
+        subject = f"{settings.FANTASY_EMAIL_SUBJECT_PREFIX} {subject}".strip()
+        send_mail(subject, body, settings.DEFAULT_FROM_EMAIL, [recipient_email], fail_silently=False)
+
+        notifications = list(team.notifications or [])
+        for item in notifications:
+            if str(item.get('id')) == str(notification_id):
+                item['email_sent'] = True
+                item['email_sent_at'] = timezone.now().isoformat()
+                item.pop('email_error', None)
+                break
+        team.notifications = notifications
+        team.save(update_fields=['notifications'])
+    except Exception as exc:
+        logger.exception("Failed to send notification email %s", notification_id)
+        try:
+            team = UserTeam.objects.get(pk=team_id)
+            notifications = list(team.notifications or [])
+            for item in notifications:
+                if str(item.get('id')) == str(notification_id):
+                    item['email_error'] = str(exc)[:240]
+                    item['email_queued'] = False
+                    break
+            team.notifications = notifications
+            team.save(update_fields=['notifications'])
+        except Exception:
+            logger.exception("Failed to store notification email error")
+
+
+def _queue_notification_email(team, notification):
+    if not getattr(settings, 'FANTASY_EMAIL_NOTIFICATIONS_ENABLED', False):
+        return
+    if notification.get('email_sent') or notification.get('email_queued'):
+        return
+    recipient_email = (team.user.email or '').strip()
+    if not recipient_email:
+        return
+
+    notification['email_queued'] = True
+    if getattr(settings, 'FANTASY_EMAIL_ASYNC', True):
+        timer = threading.Timer(
+            0.25,
+            _send_notification_email,
+            args=(team.pk, notification.get('id'), recipient_email),
+        )
+        timer.daemon = True
+        timer.start()
+    else:
+        _send_notification_email(team.pk, notification.get('id'), recipient_email)
+
+
+def _append_notification_once(team, key, message, notification_type='info', email_subject=None, email_body=None):
+    notifications = list(team.notifications or [])
+    existing = next((item for item in notifications if isinstance(item, dict) and item.get('key') == key), None)
+    if existing:
+        return False
+
+    notification = {
+        'id': key,
+        'key': key,
+        'type': notification_type,
+        'message': message,
+        'created_at': timezone.now().isoformat(),
+        'read': False,
+        'email_sent': False,
+        'email_queued': False,
+    }
+    if email_subject:
+        notification['email_subject'] = email_subject
+    if email_body:
+        notification['email_body'] = email_body
+
+    notifications.append(notification)
+    team.notifications = sorted(notifications[-60:], key=_notification_sort_key, reverse=True)
+    _queue_notification_email(team, notification)
+    return True
+
+
+def _ensure_user_notifications(team, matches=None):
+    matches = matches if matches is not None else fetch_pl_matches(limit=None)
+    now = timezone.now()
+    cleaned_notifications = [
+        item for item in list(team.notifications or [])
+        if not str((item or {}).get('key') or (item or {}).get('id') or '').startswith('transfer-reminder:')
+        and (item or {}).get('type') != 'transfer'
+    ]
+    if cleaned_notifications != list(team.notifications or []):
+        team.notifications = cleaned_notifications
+        team.save(update_fields=['notifications'])
+
+    upcoming = sorted(
+        [
+            match for match in matches
+            if match.get('status') in {'SCHEDULED', 'TIMED'} and _match_kickoff(match)
+        ],
+        key=_match_sort_kickoff,
+    )
+    changed = False
+
+    if upcoming:
+        next_match = upcoming[0]
+        kickoff = _match_kickoff(next_match)
+        matchweek = next_match.get('matchday') or 'upcoming'
+        home = (next_match.get('homeTeam') or {}).get('shortName') or (next_match.get('homeTeam') or {}).get('name')
+        away = (next_match.get('awayTeam') or {}).get('shortName') or (next_match.get('awayTeam') or {}).get('name')
+        readable_kickoff = kickoff.strftime('%d %b %Y %H:%M UTC') if kickoff else 'soon'
+        changed = _append_notification_once(
+            team,
+            f"matchweek:{matchweek}:{next_match.get('id')}",
+            f"Matchweek {matchweek} starts with {home} vs {away} on {readable_kickoff}.",
+            'matchweek',
+            email_subject=f"Upcoming matchweek {matchweek} reminder",
+        ) or changed
+        if kickoff and timedelta(hours=0) <= (kickoff - now) <= timedelta(days=3):
+            changed = _append_notification_once(
+                team,
+                f"deadline:{matchweek}:{next_match.get('id')}",
+                f"Transfer deadline reminder: review your squad before {home} vs {away}.",
+                'deadline',
+                email_subject='Transfer deadline alert',
+            ) or changed
+
+    if team.weekly_points:
+        weeks = sorted([int(key) for key in team.weekly_points.keys() if str(key).isdigit()])
+        if weeks:
+            latest_week = weeks[-1]
+            changed = _append_notification_once(
+                team,
+                f"weekly-summary:{latest_week}:{team.points}",
+                f"Weekly summary: Matchweek {latest_week} is logged and your total is now {team.points} points.",
+                'summary',
+                email_subject='Weekly fantasy performance summary',
+            ) or changed
+
+    if changed:
+        team.save(update_fields=['notifications'])
+
+    return sorted(list(team.notifications or []), key=_notification_sort_key, reverse=True)
 
 
 class GoogleLoginView(APIView):
@@ -987,18 +1701,14 @@ class UserDashboardView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        print(f"DEBUG: UserDashboardView.get called for user: {request.user}")
         try:
             team = UserTeam.objects.filter(user=request.user).first()
-            print(f"DEBUG: Team found: {team}")
             if not team:
-                print(f"DEBUG: Creating new team for user: {request.user}")
                 team = UserTeam.objects.create(user=request.user, budget=BASE_BUDGET)
             team = _ensure_team_defaults(team)
             
             # Basic consistency check: reset budget if empty team has 0 budget
             current_budget = float(team.budget)
-            print(f"DEBUG: Current budget: {current_budget}")
             if current_budget == 0 and not _clean_players(team.players):
                 team.budget = BASE_BUDGET
                 team.save()
@@ -1007,7 +1717,6 @@ class UserDashboardView(APIView):
                 {
                     'points': team.points,
                     'rank': team.rank,
-                    'transfers_left': team.free_transfers,
                     'budget': float(team.budget),
                     'team_size': len(_lineup_for_points(team)),
                     'owned_count': len(_clean_players(team.players)),
@@ -1023,8 +1732,7 @@ class UserDashboardView(APIView):
         except Exception as e:
             import traceback
             trace = traceback.format_exc()
-            print(f"ERROR in UserDashboardView: {e}")
-            print(trace)
+            logger.exception("ERROR in UserDashboardView: %s", e)
             return Response({'detail': f"Backend Error: {str(e)}", 'traceback': trace[:500]}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -1059,7 +1767,6 @@ class UserTeamView(APIView):
             'max_players': MAX_OWNED_PLAYERS,
             'points': team.points,
             'rank': team.rank,
-            'transfers_left': team.free_transfers,
             'rewards': team.rewards or [],
         })
         
@@ -1142,6 +1849,122 @@ class UserMatchesView(APIView):
 
         payload = [_match_payload(match) for match in matches]
         payload.sort(key=lambda item: _match_sort_kickoff(item), reverse=True)
+        return Response(payload)
+
+
+class UserMatchDetailView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, match_id):
+        detail = {}
+        primary_meta = {}
+        sportsdb_meta = {}
+        fallback_meta = {}
+        fallback_row = None
+        providers_attempted = []
+        providers_succeeded = []
+
+        try:
+            detail, primary_meta = fetch_match(match_id, return_meta=True)
+        except Exception as exc:
+            primary_meta = {'error': str(exc), 'source': 'football-data.org'}
+            logger.exception("Primary match detail provider failed fixture=%s: %s", match_id, exc)
+
+        if not detail:
+            try:
+                matches = fetch_pl_matches(limit=None)
+                detail = next((match for match in matches if str(match.get('id')) == str(match_id)), None)
+            except Exception as exc:
+                logger.exception("Match list fallback failed fixture=%s: %s", match_id, exc)
+
+        if not detail:
+            return Response(
+                {
+                    'id': match_id,
+                    'stats_loaded_from_detail': False,
+                    'stats': {
+                        'home': _empty_team_stats(),
+                        'away': _empty_team_stats(),
+                        'available': False,
+                        'message': 'Match details are temporarily unavailable. Please retry shortly.',
+                        'providers_attempted': ['football-data.org'],
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        payload = _match_payload(detail)
+        primary_stats = payload.get('stats') or _extract_match_stats(detail)
+        provider_stats = primary_stats
+        providers_attempted.append('football-data.org')
+        if primary_stats.get('available'):
+            providers_succeeded.append('football-data.org')
+
+        try:
+            sportsdb_data, sportsdb_meta = fetch_thesportsdb_event_stats(detail, return_meta=True)
+            sportsdb_stats = _stats_from_thesportsdb(sportsdb_data) if sportsdb_data else {'available': False}
+            providers_attempted.append('TheSportsDB')
+            provider_stats = _merge_stats(provider_stats, sportsdb_stats)
+            if sportsdb_stats.get('available'):
+                providers_succeeded.append('TheSportsDB')
+        except Exception as exc:
+            sportsdb_meta = {'error': str(exc), 'source': 'TheSportsDB'}
+            providers_attempted.append('TheSportsDB')
+            logger.exception("TheSportsDB provider failed fixture=%s: %s", match_id, exc)
+
+        try:
+            fallback_rows, fallback_meta = fetch_pl_result_stats(
+                season_start=(detail.get('season') or {}).get('startDate'),
+                return_meta=True,
+            )
+            fallback_row = _match_result_stats_row(detail, fallback_rows)
+            fallback_stats = _stats_from_result_row(fallback_row) if fallback_row else {'available': False}
+            providers_attempted.append('football-data.co.uk')
+            payload['stats'] = _merge_stats(provider_stats, fallback_stats)
+            if fallback_stats.get('available'):
+                providers_succeeded.append('football-data.co.uk')
+            if not payload['stats'].get('available'):
+                form_stats = _team_form_stats_from_rows(detail, fallback_rows)
+                payload['stats'] = _merge_stats(payload['stats'], form_stats)
+                if form_stats.get('available'):
+                    providers_succeeded.append('team-form-history')
+        except Exception as exc:
+            fallback_meta = {'error': str(exc), 'source': 'football-data.co.uk'}
+            providers_attempted.append('football-data.co.uk')
+            payload['stats'] = provider_stats
+            logger.exception("football-data.co.uk fallback provider failed fixture=%s: %s", match_id, exc)
+
+        if not payload.get('stats', {}).get('available'):
+            basic_stats = _basic_match_insight_stats(detail)
+            payload['stats'] = _merge_stats(payload.get('stats') or provider_stats, basic_stats)
+            if basic_stats.get('available'):
+                providers_succeeded.append('match-score')
+
+        payload['stats']['providers_attempted'] = providers_attempted
+        payload['stats']['providers_succeeded'] = sorted(set(providers_succeeded))
+        if not payload['stats'].get('available'):
+            payload['stats']['message'] = 'Fixture details loaded, but no statistic rows are available for this match yet.'
+
+        diagnostics = _stats_diagnostics(detail, primary_meta, sportsdb_meta, fallback_meta, fallback_row)
+        if settings.DEBUG or request.query_params.get('debug') == '1':
+            payload['stats']['diagnostics'] = diagnostics
+        payload['stats_loaded_from_detail'] = True
+        logger.info(
+            "Match stats debug fixture=%s attempted=%s succeeded=%s final_available=%s primary_url=%s primary_status=%s primary_home_keys=%s primary_away_keys=%s sportsdb_stats_url=%s sportsdb_status=%s fallback_url=%s fallback_status=%s fallback_row=%s",
+            match_id,
+            providers_attempted,
+            providers_succeeded,
+            payload['stats'].get('available'),
+            primary_meta.get('url'),
+            primary_meta.get('status'),
+            diagnostics['football_data_org']['home_statistics_keys'],
+            diagnostics['football_data_org']['away_statistics_keys'],
+            diagnostics['thesportsdb']['stats_request_url'],
+            diagnostics['thesportsdb']['stats_request_status'],
+            fallback_meta.get('url'),
+            fallback_meta.get('status'),
+            diagnostics['football_data_uk']['matched_row'],
+            )
         return Response(payload)
 
 
@@ -1435,7 +2258,8 @@ class WatchlistView(APIView):
 
     def get(self, request):
         team, _ = UserTeam.objects.get_or_create(user=request.user)
-        return Response(team.watchlist or [])
+        finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
+        return Response(_watchlist_payload(team, finished_matches))
 
     def post(self, request):
         player_id = request.data.get('id')
@@ -1457,7 +2281,7 @@ class WatchlistView(APIView):
             watchlist.append(payload)
             team.watchlist = watchlist
             team.save(update_fields=['watchlist'])
-        return Response(team.watchlist)
+        return Response(_watchlist_payload(team))
 
     def delete(self, request):
         player_id = request.data.get('id') or request.query_params.get('id')
@@ -1466,7 +2290,7 @@ class WatchlistView(APIView):
         team, _ = UserTeam.objects.get_or_create(user=request.user)
         team.watchlist = [item for item in (team.watchlist or []) if str(item.get('id')) != str(player_id)]
         team.save(update_fields=['watchlist'])
-        return Response(team.watchlist)
+        return Response(_watchlist_payload(team))
 
 
 class NotificationsView(APIView):
@@ -1474,30 +2298,53 @@ class NotificationsView(APIView):
 
     def get(self, request):
         team, _ = UserTeam.objects.get_or_create(user=request.user)
-        notifications = list(team.notifications or [])
+        matches = fetch_pl_matches(limit=None)
+        notifications = _ensure_user_notifications(team, matches)
         if not notifications:
             notifications = [
                 {
                     'id': 'welcome',
+                    'key': 'welcome',
                     'type': 'info',
                     'message': 'Build your squad and sync points after completed matchweeks.',
                     'created_at': timezone.now().isoformat(),
                     'read': False,
+                    'email_sent': False,
                 }
             ]
+            team.notifications = notifications
+            team.save(update_fields=['notifications'])
         return Response(notifications)
 
     def post(self, request):
         team, _ = UserTeam.objects.get_or_create(user=request.user)
         notifications = list(team.notifications or [])
-        notifications.append({
+        action = request.data.get('action')
+
+        if action in {'mark_read', 'mark_all_read'}:
+            notification_id = request.data.get('id')
+            for item in notifications:
+                if action == 'mark_all_read' or str(item.get('id')) == str(notification_id):
+                    item['read'] = True
+                    item['read_at'] = timezone.now().isoformat()
+            team.notifications = notifications
+            team.save(update_fields=['notifications'])
+            return Response(sorted(team.notifications or [], key=_notification_sort_key, reverse=True))
+
+        notification = {
             'id': request.data.get('id') or f"alert-{timezone.now().timestamp()}",
+            'key': request.data.get('key') or request.data.get('id') or f"alert-{timezone.now().timestamp()}",
             'type': request.data.get('type', 'info'),
             'message': request.data.get('message', 'New alert'),
             'created_at': timezone.now().isoformat(),
             'read': bool(request.data.get('read', False)),
-        })
-        team.notifications = notifications[-25:]
+            'email_sent': False,
+            'email_queued': False,
+        }
+        notifications.append(notification)
+        team.notifications = sorted(notifications[-60:], key=_notification_sort_key, reverse=True)
+        if not request.data.get('read', False):
+            _queue_notification_email(team, notification)
         team.save(update_fields=['notifications'])
         return Response(team.notifications)
 
@@ -1747,21 +2594,6 @@ def _record_key(record):
     return str(record) if record else None
 
 
-def _append_notification_once(team, key, message):
-    notifications = list(team.notifications or [])
-    if any(item.get('key') == key for item in notifications if isinstance(item, dict)):
-        return
-    notifications.append({
-        'id': key,
-        'key': key,
-        'type': 'points',
-        'message': message,
-        'created_at': timezone.now().isoformat(),
-        'read': False,
-    })
-    team.notifications = notifications[-50:]
-
-
 def _result_for_team(match, team_api_id):
     home = match.get('homeTeam') or {}
     away = match.get('awayTeam') or {}
@@ -1848,6 +2680,8 @@ def _calculate_points_from_matches(team, matches, source='real', require_ownersh
                 team,
                 f"points:{source}:{key}",
                 f"{team_name} {result['label']}. {player_name} earned {points} points.",
+                'points',
+                email_subject='Fantasy points update',
             )
 
     if processed_count:
@@ -1907,12 +2741,33 @@ def _reset_simulation_points(team):
     return removed_points
 
 
-def sync_user_points(user, initial=False):
+def _points_sync_due(team, force=False):
+    if force:
+        return True
+    interval = int(getattr(settings, 'POINT_SYNC_INTERVAL_SECONDS', 900))
+    if not team.last_synced_at:
+        return True
+    return timezone.now() - team.last_synced_at >= timedelta(seconds=interval)
+
+
+def sync_user_points(user, initial=False, force=False):
     """Sync finished match points for selected players without duplicate awards."""
+    lock_acquired = False
     try:
         team, _ = UserTeam.objects.get_or_create(user=user)
+        if not _points_sync_due(team, force=force or initial):
+            return 0
+
+        lock_key = f"points-sync-lock:{user.pk}"
+        if not cache.add(lock_key, True, timeout=60):
+            logger.info("Skipping concurrent point sync for user %s", user.pk)
+            return 0
+        lock_acquired = True
+
         finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
         if not finished_matches:
+            team.last_synced_at = timezone.now()
+            team.save(update_fields=['last_synced_at'])
             return 0
 
         if initial and not team.processed_match_results:
@@ -1923,8 +2778,11 @@ def sync_user_points(user, initial=False):
         result = _calculate_points_from_matches(team, finished_matches, source='real')
         return result['new_points']
     except Exception as e:
-        print(f"Error syncing points for {user.email}: {e}")
+        logger.exception("Error syncing points for %s: %s", user.email, e)
         return 0
+    finally:
+        if lock_acquired:
+            cache.delete(f"points-sync-lock:{user.pk}")
 
 
 class SyncPointsView(APIView):
@@ -1932,7 +2790,8 @@ class SyncPointsView(APIView):
 
     def post(self, request):
         initial = request.data.get('initial', False)
-        new_points = sync_user_points(request.user, initial=initial)
+        force = bool(request.data.get('force', False))
+        new_points = sync_user_points(request.user, initial=initial, force=force)
         
         team = UserTeam.objects.get(user=request.user)
         return Response({

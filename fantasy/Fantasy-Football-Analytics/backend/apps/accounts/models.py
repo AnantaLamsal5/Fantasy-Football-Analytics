@@ -35,7 +35,6 @@ class AdminProfile(models.Model):
 class UserTeam(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='team')
     budget = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('50000000.00'))
-    free_transfers = models.PositiveIntegerField(default=1)
     players = models.JSONField(default=list, blank=True) # Bought/owned players.
     selected_players = models.JSONField(default=list, blank=True) # Lineup slots selected from owned players.
     squads = models.JSONField(default=list, blank=True) # Named squad layouts.

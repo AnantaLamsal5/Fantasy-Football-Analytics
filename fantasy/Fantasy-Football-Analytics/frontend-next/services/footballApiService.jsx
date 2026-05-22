@@ -4,6 +4,10 @@ export function getMatches() {
   return apiGet("/api/user/matches/");
 }
 
+export function getMatchDetails(matchId) {
+  return apiGet(`/api/user/matches/${encodeURIComponent(matchId)}/`);
+}
+
 export function getLiveScores() {
   return apiGet("/api/user/matches/live/");
 }

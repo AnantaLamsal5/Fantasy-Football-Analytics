@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { motion } from 'framer-motion';
-import { ArrowRight, Activity, Brain, Trophy } from 'lucide-react';
+import { ArrowRight, Activity, Brain, Trophy, Radio, TrendingUp, Users } from 'lucide-react';
 import { APP_ROUTES } from '@/utils/constants';
 
 const containerVariants = {
@@ -102,11 +102,11 @@ export default function Home() {
         </motion.div>
       </motion.div>
       <footer className="z-10 w-full max-w-5xl mt-16 pt-8 border-t border-border/50">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-sm text-muted-foreground">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-8 text-sm text-muted-foreground">
           <div>
             <div className="flex items-center gap-3 text-card-foreground font-bold mb-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-                F
+              <div className="h-8 w-8 rounded-lg overflow-hidden bg-black/20 shadow">
+                <img src="/FF_App_logo.png" alt="Fantasy Football" className="h-full w-full object-cover" />
               </div>
               Fantasy Football
             </div>
@@ -115,13 +115,20 @@ export default function Home() {
             </p>
           </div>
           <div>
-            <h3 className="text-card-foreground font-semibold mb-2">Quick Links</h3>
-            <div className="flex flex-wrap gap-x-4 gap-y-2">
-              <Link href={APP_ROUTES.home} className="hover:text-foreground">Home</Link>
-              <Link href={APP_ROUTES.matches} className="hover:text-foreground">Matches</Link>
-              <Link href={APP_ROUTES.leaderboard} className="hover:text-foreground">Leaderboard</Link>
-              <Link href={APP_ROUTES.login} className="hover:text-foreground">Login</Link>
-              <Link href={APP_ROUTES.signup} className="hover:text-foreground">Signup</Link>
+            <h3 className="text-card-foreground font-semibold mb-3">Fantasy Insights</h3>
+            <div className="space-y-3">
+              <div className="flex items-start gap-3">
+                <TrendingUp className="mt-0.5 h-4 w-4 text-primary" />
+                <p>Track form swings before making transfer decisions.</p>
+              </div>
+              <div className="flex items-start gap-3">
+                <Radio className="mt-0.5 h-4 w-4 text-primary" />
+                <p>Follow match updates and fixture difficulty in one place.</p>
+              </div>
+              <div className="flex items-start gap-3">
+                <Users className="mt-0.5 h-4 w-4 text-primary" />
+                <p>Compare your squad progress with the live leaderboard.</p>
+              </div>
             </div>
           </div>
           <div>

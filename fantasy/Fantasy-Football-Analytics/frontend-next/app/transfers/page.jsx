@@ -145,6 +145,22 @@ export default function TransfersPage() {
     }).format(num);
   };
 
+  const formatMetric = (value, suffix = "") => {
+    if (value === null || value === undefined || value === "") return "-";
+    return `${value}${suffix}`;
+  };
+
+  const performanceTone = (row) => {
+    const score =
+      Number(row.goals || 0) * 3 +
+      Number(row.assists || 0) * 2 +
+      Number(row.saves || 0) * 0.5 +
+      Number(row.rating || 0);
+    if (score >= 8 || Number(row.rating || 0) >= 7.5) return "border-green-500/30 bg-green-500/10";
+    if (row.data_available && score <= 2) return "border-red-500/30 bg-red-500/10";
+    return "border-border bg-muted/10";
+  };
+
   const ownedPlayerIds = new Set((myTeam.players || []).filter(Boolean).map((p) => String(p.id)));
   const ownedCount = myTeam.owned_count ?? (myTeam.players || []).filter(Boolean).length;
   const maxPlayers = myTeam.max_players || 15;
@@ -405,13 +421,63 @@ export default function TransfersPage() {
 
           <div className="card p-6">
             <h3 className="font-bold text-sm uppercase tracking-widest text-muted-foreground mb-4">Watchlist</h3>
-            <div className="space-y-2">
-              {watchlist.slice(0, 5).map((player) => (
-                <div key={player.id} className="flex items-center justify-between p-2 rounded border border-border">
-                  <span className="text-sm font-bold">{player.name}</span>
-                  <button onClick={() => toggleWatchlist(player)} className="text-xs text-primary">Remove</button>
-                </div>
-              ))}
+            <div className="space-y-4">
+              {watchlist.map((player) => {
+                const recent = player.recent_performance || [];
+                return (
+                  <div key={player.id} className="rounded-lg border border-border bg-muted/10 p-3">
+                    <div className="mb-3 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-black">{player.name}</p>
+                        <p className="text-[11px] text-muted-foreground">{player.position} - {player.team}</p>
+                      </div>
+                      <button onClick={() => toggleWatchlist(player)} className="text-xs font-bold text-primary">Remove</button>
+                    </div>
+
+                    {recent.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[520px] text-left text-[11px]">
+                          <thead className="text-muted-foreground">
+                            <tr>
+                              <th className="py-2 pr-2">MW</th>
+                              <th className="py-2 pr-2">Min</th>
+                              <th className="py-2 pr-2">G</th>
+                              <th className="py-2 pr-2">A</th>
+                              <th className="py-2 pr-2">Pass</th>
+                              <th className="py-2 pr-2">Tkl</th>
+                              <th className="py-2 pr-2">Sv</th>
+                              <th className="py-2 pr-2">Rate</th>
+                            </tr>
+                          </thead>
+                          <tbody className="space-y-1">
+                            {recent.map((row) => (
+                              <tr key={`${player.id}-${row.match_id}`} className={`border-t ${performanceTone(row)}`}>
+                                <td className="py-2 pr-2 font-bold">{formatMetric(row.matchweek)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.minutes)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.goals)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.assists)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.passes_completed)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.tackles)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.saves)}</td>
+                                <td className="py-2 pr-2 font-bold">{formatMetric(row.rating)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {!player.performance_available ? (
+                          <p className="mt-2 text-[11px] text-muted-foreground">
+                            Recent fixtures found, but detailed player stats are not available from the current feed yet.
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">
+                        No recent performance data available for this player yet.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
               {watchlist.length === 0 ? <p className="text-sm text-muted-foreground">No favorite players yet.</p> : null}
             </div>
           </div>

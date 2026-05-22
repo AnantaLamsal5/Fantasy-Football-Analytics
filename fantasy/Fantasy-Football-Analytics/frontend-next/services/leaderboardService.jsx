@@ -21,8 +21,16 @@ export function getNotifications() {
   return apiGet("/api/user/notifications/");
 }
 
-export function syncPoints(initial = false) {
-  return apiPost("/api/user/sync-points/", { initial });
+export function markNotificationRead(id) {
+  return apiPost("/api/user/notifications/", { action: "mark_read", id });
+}
+
+export function markAllNotificationsRead() {
+  return apiPost("/api/user/notifications/", { action: "mark_all_read" });
+}
+
+export function syncPoints(initial = false, force = false) {
+  return apiPost("/api/user/sync-points/", { initial, force });
 }
 
 export function simulateLastMatchweekPoints(reset = false) {

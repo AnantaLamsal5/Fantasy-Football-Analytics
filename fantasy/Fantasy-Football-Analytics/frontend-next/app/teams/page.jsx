@@ -39,7 +39,7 @@ const FORMATION_PRESETS = [
 export default function TeamsPage() {
   const [ownedPlayers, setOwnedPlayers] = useState([]);
   const [filter, setFilter] = useState("");
-  const [team, setTeam] = useState({ players: [], formation: "4-4-2", budget: 50000000, transfers_left: 1, owned_count: 0, max_players: 15 });
+  const [team, setTeam] = useState({ players: [], formation: "4-4-2", budget: 50000000, owned_count: 0, max_players: 15 });
   const [squads, setSquads] = useState([]);
   const [currentSquadId, setCurrentSquadId] = useState("default");
   const [squadName, setSquadName] = useState("Main Squad");
@@ -92,7 +92,6 @@ export default function TeamsPage() {
       players: nextSelected,
       formation: payload?.formation || "4-4-2",
       budget: payload?.budget ?? 50000000,
-      transfers_left: payload?.transfers_left ?? 1,
       owned_count: payload?.owned_count ?? boughtPlayers.length,
       max_players: payload?.max_players ?? 15,
     });

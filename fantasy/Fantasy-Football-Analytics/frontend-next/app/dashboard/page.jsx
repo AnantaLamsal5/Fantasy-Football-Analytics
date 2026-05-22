@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Activity, Bell, TrendingUp, Trophy, Users } from "lucide-react";
-import { getDashboard, getNotifications } from "@/services/leaderboardService";
+import { Activity, TrendingUp, Trophy, Users } from "lucide-react";
+import { getDashboard } from "@/services/leaderboardService";
 import { getTopAttackers } from "@/services/footballApiService";
 
 const containerVariants = {
@@ -23,41 +23,45 @@ const itemVariants = {
   },
 };
 
-function formatAlertDate(dateString) {
-  try {
-    const date = new Date(dateString);
-    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-    const dayName = days[date.getUTCDay()];
-    const dayNum = date.getUTCDate();
-    const monthName = months[date.getUTCMonth()];
-    const year = date.getUTCFullYear();
-    return `${dayName}, ${dayNum} ${monthName} ${year}`;
-  } catch (e) {
-    return "Unknown date";
-  }
-}
-
 export default function DashboardPage() {
   const [data, setData] = useState(null);
-  const [notifications, setNotifications] = useState([]);
   const [topAttackers, setTopAttackers] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([getDashboard(), getNotifications(), getTopAttackers().catch(() => [])])
-      .then(([payload, alerts, attackers]) => {
+    Promise.all([getDashboard(), getTopAttackers().catch(() => [])])
+      .then(([payload, attackers]) => {
         if (mounted) {
           setData(payload);
-          setNotifications(alerts || []);
           setTopAttackers(attackers || []);
+          if (typeof window !== "undefined") {
+            localStorage.setItem("ff_dashboard_cache", JSON.stringify({
+              payload,
+              attackers: attackers || [],
+              cached_at: Date.now(),
+            }));
+          }
           setLoading(false);
         }
       })
       .catch((err) => {
         if (mounted) {
+          try {
+            const cached = typeof window !== "undefined"
+              ? JSON.parse(localStorage.getItem("ff_dashboard_cache") || "{}")
+              : {};
+            if (cached.payload) {
+              setData(cached.payload);
+              setTopAttackers(cached.attackers || []);
+              setError("");
+              setLoading(false);
+              return;
+            }
+          } catch (cacheError) {
+            console.warn("Failed to read dashboard cache", cacheError);
+          }
           setError(err.message || "Failed to load dashboard.");
           setLoading(false);
         }
@@ -236,25 +240,6 @@ export default function DashboardPage() {
                 <span className="text-muted-foreground">Rank</span>
                 <span className="font-bold">{data?.rank || "N/A"}</span>
               </div>
-            </div>
-          </div>
-          <div className="card p-6">
-            <h3 className="text-xl font-bold flex items-center mb-6">
-              <Bell className="mr-2 h-5 w-5 text-primary" />
-              Alerts
-            </h3>
-            <div className="space-y-3 text-sm">
-              {notifications.slice(0, 4).map((alert) => (
-                <div key={alert.id} className="p-3 rounded border border-border/30">
-                  {alert.created_at && (
-                    <p className="text-xs text-muted-foreground mb-1">
-                      {formatAlertDate(alert.created_at)}
-                    </p>
-                  )}
-                  <p className="font-medium">{alert.message}</p>
-                  <p className="text-xs text-muted-foreground mt-1">{alert.type}</p>
-                </div>
-              ))}
             </div>
           </div>
         </motion.div>

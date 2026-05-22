@@ -172,6 +172,24 @@ EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'webmaster@localhost')
 EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', '15'))
+FANTASY_EMAIL_NOTIFICATIONS_ENABLED = env_bool(
+    'FANTASY_EMAIL_NOTIFICATIONS_ENABLED',
+    bool(EMAIL_HOST_USER and EMAIL_HOST_PASSWORD),
+)
+FANTASY_EMAIL_ASYNC = env_bool('FANTASY_EMAIL_ASYNC', True)
+FANTASY_EMAIL_SUBJECT_PREFIX = os.environ.get('FANTASY_EMAIL_SUBJECT_PREFIX', '[Fantasy Football]')
+FOOTBALL_DATA_CACHE_SECONDS = int(os.environ.get('FOOTBALL_DATA_CACHE_SECONDS', '120'))
+MATCH_STATS_CACHE_SECONDS = int(os.environ.get('MATCH_STATS_CACHE_SECONDS', str(6 * 60 * 60)))
+POINT_SYNC_INTERVAL_SECONDS = int(os.environ.get('POINT_SYNC_INTERVAL_SECONDS', '900'))
+THESPORTSDB_API_KEY = os.environ.get('THESPORTSDB_API_KEY', '123')
+THESPORTSDB_CACHE_SECONDS = int(os.environ.get('THESPORTSDB_CACHE_SECONDS', str(6 * 60 * 60)))
+
+CACHES = {
+    'default': {
+        'BACKEND': os.environ.get('DJANGO_CACHE_BACKEND', 'django.core.cache.backends.locmem.LocMemCache'),
+        'LOCATION': os.environ.get('DJANGO_CACHE_LOCATION', 'fantasy-football-cache'),
+    }
+}
 
 MIGRATION_MODULES = {
     'admin': 'mongo_migrations.admin',

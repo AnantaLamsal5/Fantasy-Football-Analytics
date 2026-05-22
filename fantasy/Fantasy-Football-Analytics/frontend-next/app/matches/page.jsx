@@ -1,9 +1,9 @@
 "use client";
 
-import { motion } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
-import { Calendar, Clock, Trophy, ChevronRight, Filter, AlertCircle, X } from "lucide-react";
-import { getLiveScores, getMatchDifficulty, getMatches } from "@/services/footballApiService";
+import { Calendar, Clock, Trophy, ChevronRight, Filter, AlertCircle, BarChart3, RotateCcw } from "lucide-react";
+import { getLiveScores, getMatchDetails, getMatchDifficulty, getMatches } from "@/services/footballApiService";
 import { syncPoints } from "@/services/leaderboardService";
 import ProtectedRoute from "@/components/ProtectedRoute";
 
@@ -15,6 +15,9 @@ export default function MatchesPage() {
   const [liveScores, setLiveScores] = useState([]);
   const [difficulty, setDifficulty] = useState([]);
   const [selectedMatch, setSelectedMatch] = useState(null);
+  const [matchDetails, setMatchDetails] = useState({});
+  const [loadingDetails, setLoadingDetails] = useState({});
+  const [detailErrors, setDetailErrors] = useState({});
 
   useEffect(() => {
     let mounted = true;
@@ -87,21 +90,138 @@ export default function MatchesPage() {
     return `${formatDate(dateStr)} at ${formatTime(dateStr)}`;
   };
 
-  const detailRows = selectedMatch
-    ? [
-        ["Competition", selectedMatch.competition],
-        ["Season", selectedMatch.season_start && selectedMatch.season_end ? `${selectedMatch.season_start} to ${selectedMatch.season_end}` : null],
-        ["Matchweek", selectedMatch.matchday ? `Matchweek ${selectedMatch.matchday}` : null],
-        ["Stage", selectedMatch.stage],
-        ["Kickoff", formatDateTime(selectedMatch.kickoff)],
-        ["Last updated", selectedMatch.last_updated ? formatDateTime(selectedMatch.last_updated) : null],
-        ["Half time", selectedMatch.half_time_score],
-        ["Full time", selectedMatch.full_time_score],
-        ["Winner", selectedMatch.winner ? selectedMatch.winner.replace("_TEAM", " team").toLowerCase() : null],
-        ["Duration", selectedMatch.duration],
-        ["Referee", selectedMatch.referees?.length ? selectedMatch.referees.join(", ") : null],
-      ].filter(([, value]) => value)
-    : [];
+  const getDetailRows = (match) =>
+    [
+      ["Competition", match.competition],
+      ["Season", match.season_start && match.season_end ? `${match.season_start} to ${match.season_end}` : null],
+      ["Matchweek", match.matchday ? `Matchweek ${match.matchday}` : null],
+      ["Stage", match.stage],
+      ["Kickoff", formatDateTime(match.kickoff)],
+      ["Last updated", match.last_updated ? formatDateTime(match.last_updated) : null],
+      ["Half time", match.half_time_score],
+      ["Full time", match.full_time_score],
+      ["Winner", match.winner ? match.winner.replace("_TEAM", " team").toLowerCase() : null],
+      ["Duration", match.duration],
+      ["Referee", match.referees?.length ? match.referees.join(", ") : null],
+    ].filter(([, value]) => value);
+
+  const statLabels = [
+    ["goals", "Goals"],
+    ["half_time_goals", "Half-time goals"],
+    ["shots", "Total shots"],
+    ["shots_on_target", "Shots on target"],
+    ["possession", "Possession", "%"],
+    ["pass_accuracy", "Pass accuracy", "%"],
+    ["passes", "Total passes"],
+    ["fouls", "Fouls"],
+    ["yellow_cards", "Yellow cards"],
+    ["yellow_red_cards", "Second yellows"],
+    ["red_cards", "Red cards"],
+    ["offsides", "Offsides"],
+    ["corners", "Corners"],
+    ["saves", "Saves"],
+    ["shots_off_target", "Shots off target"],
+    ["free_kicks", "Free kicks"],
+    ["goal_kicks", "Goal kicks"],
+    ["throw_ins", "Throw-ins"],
+    ["xg", "Expected goals"],
+    ["big_chances", "Big chances"],
+  ];
+
+  const formatStat = (value, suffix = "") => {
+    if (value === null || value === undefined || value === "") return "-";
+    return `${value}${suffix}`;
+  };
+
+  const comparisonPercent = (homeValue, awayValue) => {
+    const home = Number(homeValue || 0);
+    const away = Number(awayValue || 0);
+    if (!home && !away) return 50;
+    return Math.max(8, Math.min(92, (home / (home + away)) * 100));
+  };
+
+  const hasUsableDetail = (detail) => Boolean(detail?.stats?.available || detail?.events?.length);
+
+  async function loadMatchDetails(match, force = false) {
+    const matchId = String(match.id);
+    if (!force && (matchDetails[matchId] || loadingDetails[matchId])) return;
+
+    setLoadingDetails((prev) => ({ ...prev, [matchId]: true }));
+    setDetailErrors((prev) => ({ ...prev, [matchId]: "" }));
+    try {
+      const detail = await getMatchDetails(match.id);
+      setMatchDetails((prev) => ({ ...prev, [matchId]: detail }));
+      setDetailErrors((prev) => ({ ...prev, [matchId]: "" }));
+      setMatches((prev) => prev.map((item) => (String(item.id) === matchId ? { ...item, ...detail } : item)));
+      if (typeof window !== "undefined" && hasUsableDetail(detail)) {
+        const cached = JSON.parse(localStorage.getItem("ff_match_details_cache") || "{}");
+        cached[matchId] = { detail };
+        localStorage.setItem("ff_match_details_cache", JSON.stringify(cached));
+      }
+    } catch (err) {
+      let cachedDetail = null;
+      try {
+        const cached = typeof window !== "undefined"
+          ? JSON.parse(localStorage.getItem("ff_match_details_cache") || "{}")
+          : {};
+        const candidate = cached[matchId]?.detail || null;
+        cachedDetail = hasUsableDetail(candidate) ? candidate : null;
+      } catch (cacheError) {
+        console.warn("Failed to read cached match details", cacheError);
+      }
+
+      if (cachedDetail) {
+        setMatchDetails((prev) => ({ ...prev, [matchId]: cachedDetail }));
+        setDetailErrors((prev) => ({
+          ...prev,
+          [matchId]: "Showing cached statistics while providers are temporarily unavailable.",
+        }));
+      } else {
+        setMatchDetails((prev) => ({
+          ...prev,
+          [matchId]: {
+            ...match,
+            stats: {
+              home: {},
+              away: {},
+              available: false,
+              message: "Statistics providers are temporarily unavailable. Please retry in a moment.",
+              providers_attempted: ["football-data.org", "TheSportsDB", "football-data.co.uk"],
+            },
+          },
+        }));
+        setDetailErrors((prev) => ({
+          ...prev,
+          [matchId]: "Statistics providers are temporarily unavailable. Please retry in a moment.",
+        }));
+      }
+    } finally {
+      setLoadingDetails((prev) => ({ ...prev, [matchId]: false }));
+    }
+  }
+
+  async function toggleMatchDetails(match) {
+    const matchId = String(match.id);
+    if (String(selectedMatch?.id) === matchId) {
+      setSelectedMatch(null);
+      return;
+    }
+
+    setSelectedMatch(match);
+    await loadMatchDetails(match);
+  }
+
+  async function retryMatchDetails(match) {
+    const matchId = String(match.id);
+    setMatchDetails((prev) => {
+      const next = { ...prev };
+      delete next[matchId];
+      return next;
+    });
+    setDetailErrors((prev) => ({ ...prev, [matchId]: "" }));
+    setSelectedMatch(match);
+    await loadMatchDetails(match, true);
+  }
 
   return (
     <ProtectedRoute>
@@ -180,15 +300,30 @@ export default function MatchesPage() {
             </div>
           ) : null}
           {filteredMatches.length > 0 ? (
-            filteredMatches.map((match, idx) => (
-              <motion.div
-                key={match.id || idx}
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: idx * 0.05 }}
-                className="group relative"
-              >
-                <div className="card hover:border-primary/50 transition-all duration-300 overflow-hidden">
+            filteredMatches.map((match, idx) => {
+              const isExpanded = String(selectedMatch?.id) === String(match.id);
+              const matchId = String(match.id);
+              const displayMatch = matchDetails[matchId] || match;
+              const detailRows = getDetailRows(displayMatch);
+              const stats = displayMatch.stats || {};
+              const hasStats = Boolean(stats.available);
+              const visibleStatLabels = statLabels.filter(([key]) => {
+                const homeValue = stats.home?.[key];
+                const awayValue = stats.away?.[key];
+                return homeValue !== null && homeValue !== undefined || awayValue !== null && awayValue !== undefined;
+              });
+              const events = displayMatch.events || [];
+              const isDetailLoading = Boolean(loadingDetails[matchId]);
+              const detailError = detailErrors[matchId];
+              return (
+                <motion.div
+                  key={match.id || idx}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: idx * 0.05 }}
+                  className="group relative"
+                >
+                  <div className="card hover:border-primary/50 transition-all duration-300 overflow-hidden">
                   <div className="absolute top-0 left-0 w-1 h-full bg-primary opacity-0 group-hover:opacity-100 transition-opacity"></div>
                   
                   <div className="p-6 flex flex-col md:flex-row items-center justify-between gap-6">
@@ -211,7 +346,7 @@ export default function MatchesPage() {
                       </div>
                       
                       <div className="flex flex-col items-center justify-center min-w-[80px]">
-                        {match.status === "FINISHED" ? (
+                        {match.status === "FINISHED" && match.score ? (
                           <div className="bg-primary/10 text-primary px-4 py-2 rounded-xl border border-primary/20 flex items-center gap-3">
                             <span className="text-2xl font-black">{match.score.split(' - ')[0]}</span>
                             <span className="text-muted-foreground font-light">:</span>
@@ -236,17 +371,154 @@ export default function MatchesPage() {
                     <div className="block">
                       <button
                         type="button"
-                        onClick={() => setSelectedMatch(match)}
+                        onClick={() => toggleMatchDetails(match)}
                         aria-label={`View details for ${match.home_team} vs ${match.away_team}`}
                         className="h-10 w-10 rounded-full bg-muted flex items-center justify-center hover:bg-primary hover:text-primary-foreground transition-all"
                       >
-                        <ChevronRight className="h-5 w-5" />
+                        <ChevronRight className={`h-5 w-5 transition-transform ${isExpanded ? "rotate-90" : ""}`} />
                       </button>
                     </div>
                   </div>
+
+                  <AnimatePresence initial={false}>
+                    {isExpanded ? (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.25 }}
+                        className="overflow-hidden border-t border-border/60 bg-background/30"
+                      >
+                        <div className="p-6 space-y-6">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-xs font-black uppercase tracking-widest text-primary">Match center</p>
+                              <h3 className="mt-1 text-xl font-black">{displayMatch.home_team} vs {displayMatch.away_team}</h3>
+                            </div>
+                            <BarChart3 className="h-6 w-6 text-primary" />
+                          </div>
+
+                          {isDetailLoading ? (
+                            <div className="rounded-lg border border-border bg-muted/10 p-4">
+                              <div className="mb-5 grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+                                <div className="ml-auto h-4 w-28 animate-pulse rounded bg-muted" />
+                                <div className="h-3 w-10 animate-pulse rounded bg-muted" />
+                                <div className="h-4 w-28 animate-pulse rounded bg-muted" />
+                              </div>
+                              <div className="space-y-4">
+                                {[1, 2, 3, 4, 5, 6].map((item) => (
+                                  <div key={item} className="space-y-2">
+                                    <div className="mx-auto h-3 w-40 animate-pulse rounded bg-muted" />
+                                    <div className="h-2 animate-pulse rounded-full bg-muted" />
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : hasStats ? (
+                            <div className="rounded-lg border border-border bg-muted/10 p-4">
+                              <div className="mb-4 grid grid-cols-[1fr_auto_1fr] items-center gap-3 text-sm font-black">
+                                <span className="truncate text-right">{displayMatch.home_team}</span>
+                                <span className="text-xs uppercase tracking-widest text-muted-foreground">
+                                  {stats.source === "football-data.co.uk" ? "Result stats" : "Stats"}
+                                </span>
+                                <span className="truncate text-left">{displayMatch.away_team}</span>
+                              </div>
+                              <div className="space-y-4">
+                                {visibleStatLabels.map(([key, label, suffix]) => {
+                                  const homeValue = stats.home?.[key];
+                                  const awayValue = stats.away?.[key];
+                                  const width = comparisonPercent(homeValue, awayValue);
+                                  const showBar = ["possession", "pass_accuracy", "shots", "shots_on_target", "passes"].includes(key);
+                                  return (
+                                    <div key={key} className="space-y-2">
+                                      <div className="grid grid-cols-[3rem_1fr_3rem] items-center gap-3 text-xs">
+                                        <span className="text-right font-black">{formatStat(homeValue, suffix)}</span>
+                                        <span className="text-center text-muted-foreground">{label}</span>
+                                        <span className="font-black">{formatStat(awayValue, suffix)}</span>
+                                      </div>
+                                      {showBar ? (
+                                        <div className="flex h-2 overflow-hidden rounded-full bg-muted">
+                                          <div className="bg-primary" style={{ width: `${width}%` }} />
+                                          <div className="bg-cyan-200/40" style={{ width: `${100 - width}%` }} />
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              {stats.unavailable_fields?.length ? (
+                                <p className="mt-4 text-[11px] text-muted-foreground">
+                                  Some provider fields are not published for this fixture: {stats.unavailable_fields.map((field) => field.replaceAll("_", " ")).join(", ")}.
+                                </p>
+                              ) : null}
+                              {stats.providers_succeeded?.length ? (
+                                <p className="mt-2 text-[11px] text-muted-foreground">
+                                  Source: {stats.providers_succeeded.join(", ")}
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : (
+                            <div className="rounded-lg border border-dashed border-border p-5 text-sm text-muted-foreground">
+                              <div className="text-center">
+                                <p className="font-bold text-card-foreground">
+                                  {detailError?.includes("cached") ? "Limited cached statistics" : "Advanced statistics are unavailable for this match."}
+                                </p>
+                                <p className="mx-auto mt-2 max-w-xl">
+                                  {detailError || stats.message || "All configured providers were checked. Scores, fixture details, and available timeline events are still shown below."}
+                                </p>
+                                <div className="mt-3 text-[11px]">
+                                  Providers checked: {(stats.providers_attempted || ["football-data.org", "TheSportsDB", "football-data.co.uk"]).join(", ")}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => retryMatchDetails(match)}
+                                  className="mt-4 inline-flex items-center gap-2 rounded-md border border-border px-3 py-2 text-xs font-black text-primary hover:bg-muted"
+                                >
+                                  <RotateCcw className="h-4 w-4" />
+                                  Retry providers
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {events.length > 0 ? (
+                            <div className="rounded-lg border border-border bg-muted/10 p-4">
+                              <h4 className="mb-3 text-sm font-black">Match timeline</h4>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                {events.slice(0, 10).map((event, eventIndex) => (
+                                  <div key={`${event.minute}-${event.type}-${eventIndex}`} className="rounded-md border border-border/60 p-3 text-xs">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="font-black text-primary">
+                                        {event.minute ?? "-"}{event.injury_time ? `+${event.injury_time}` : "'"}
+                                      </span>
+                                      <span className="text-[10px] uppercase tracking-widest text-muted-foreground">{event.label}</span>
+                                    </div>
+                                    <p className="mt-1 font-bold">{event.player || event.team || "Match event"}</p>
+                                    {event.assist ? <p className="text-muted-foreground">Assist: {event.assist}</p> : null}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {detailRows.map(([label, value]) => (
+                              <div key={label} className="rounded-lg border border-border p-4 bg-muted/20">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-1">
+                                  {label}
+                                </p>
+                                <p className="text-sm font-bold capitalize">{value}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </motion.div>
+                    ) : null}
+                  </AnimatePresence>
                 </div>
               </motion.div>
-            ))
+              );
+            })
           ) : (
             <div className="card p-20 text-center flex flex-col items-center">
               <Trophy className="h-12 w-12 text-muted-foreground mb-4 opacity-20" />
@@ -255,66 +527,6 @@ export default function MatchesPage() {
           )}
         </div>
       )}
-      {selectedMatch ? (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.96 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden"
-          >
-            <div className="p-6 border-b border-border flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-black uppercase tracking-widest text-primary mb-2">
-                  {selectedMatch.status}
-                </p>
-                <h2 className="text-2xl font-black">
-                  {selectedMatch.home_team} vs {selectedMatch.away_team}
-                </h2>
-                <p className="text-sm text-muted-foreground mt-1">{formatDateTime(selectedMatch.kickoff)}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelectedMatch(null)}
-                aria-label="Close match details"
-                className="h-10 w-10 rounded-full bg-muted flex items-center justify-center hover:bg-primary hover:text-primary-foreground transition-all"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <div className="p-6">
-              <div className="flex items-center justify-center gap-4 md:gap-8 mb-8">
-                <div className="flex-1 text-right">
-                  <p className="text-lg font-black">{selectedMatch.home_team}</p>
-                  <p className="text-xs text-muted-foreground">Home</p>
-                </div>
-                <div className="min-w-[120px] text-center">
-                  {selectedMatch.score ? (
-                    <div className="text-4xl font-black text-primary">{selectedMatch.score.replace(" - ", " : ")}</div>
-                  ) : (
-                    <div className="px-4 py-3 rounded-xl bg-muted text-xs font-black uppercase tracking-widest">VS</div>
-                  )}
-                </div>
-                <div className="flex-1 text-left">
-                  <p className="text-lg font-black">{selectedMatch.away_team}</p>
-                  <p className="text-xs text-muted-foreground">Away</p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {detailRows.map(([label, value]) => (
-                  <div key={label} className="rounded-xl border border-border p-4 bg-muted/20">
-                    <p className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-1">
-                      {label}
-                    </p>
-                    <p className="text-sm font-bold capitalize">{value}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </motion.div>
-        </div>
-      ) : null}
       </div>
     </ProtectedRoute>
   );
