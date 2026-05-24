@@ -24,7 +24,7 @@ export default function SignupPage() {
       if (res?.signup_token) {
         setSignupToken(res.signup_token);
       }
-      setMessage("Verification code sent.");
+      setMessage("Verification code sent to your email.");
     } catch (err) {
       setError(err.message || "Unable to request code.");
     } finally {

@@ -16,6 +16,7 @@ import {
   getMyTeamSuggestions,
   getPlayerPerformance,
   getWeekPredictions,
+  searchPlayerNames,
 } from "@/services/predictionService";
 import { getTransferMarket } from "@/services/transferService";
 
@@ -42,6 +43,9 @@ export default function PredictionsPage() {
   const [projection, setProjection] = useState(null);
   const [playerName, setPlayerName] = useState("");
   const [playerPerformance, setPlayerPerformance] = useState(null);
+  const [playerSuggestions, setPlayerSuggestions] = useState([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -69,6 +73,36 @@ export default function PredictionsPage() {
     };
   }, []);
 
+  useEffect(() => {
+    const query = playerName.trim();
+    if (query.length < 2) {
+      return undefined;
+    }
+
+    let active = true;
+    const timeoutId = window.setTimeout(() => {
+      setSuggestionsLoading(true);
+      searchPlayerNames(query)
+        .then((names) => {
+          if (!active) return;
+          setPlayerSuggestions(Array.isArray(names) ? names : []);
+          setSuggestionsOpen(true);
+        })
+        .catch(() => {
+          if (!active) return;
+          setPlayerSuggestions([]);
+        })
+        .finally(() => {
+          if (active) setSuggestionsLoading(false);
+        });
+    }, 300);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeoutId);
+    };
+  }, [playerName]);
+
   async function analyzePlayer(event) {
     event.preventDefault();
     if (!playerName.trim()) return;
@@ -83,6 +117,15 @@ export default function PredictionsPage() {
   const transferSuggestions = Array.isArray(teamSuggestions?.transfer_suggestions)
     ? teamSuggestions.transfer_suggestions
     : [];
+  const similarPlayers = Array.isArray(playerPerformance?.similar_players)
+    ? playerPerformance.similar_players
+    : [];
+
+  function selectPlayerSuggestion(name) {
+    setPlayerName(name);
+    setPlayerSuggestions([]);
+    setSuggestionsOpen(false);
+  }
 
   return (
     <div className="container mx-auto p-6 md:p-10 max-w-7xl">
@@ -273,28 +316,82 @@ export default function PredictionsPage() {
           Player Performance Analysis
         </h2>
         <form onSubmit={analyzePlayer} className="flex flex-col md:flex-row gap-3">
-          <input
-            className="flex-1 px-4 py-2 rounded-md bg-input border border-border text-foreground"
-            placeholder="Enter player name"
-            value={playerName}
-            onChange={(e) => setPlayerName(e.target.value)}
-          />
+          <div className="relative flex-1">
+            <input
+              className="w-full px-4 py-2 rounded-md bg-input border border-border text-foreground"
+              placeholder="Enter player name"
+              value={playerName}
+              onChange={(e) => {
+                const nextValue = e.target.value;
+                setPlayerName(nextValue);
+                setSuggestionsOpen(true);
+                if (nextValue.trim().length < 2) {
+                  setPlayerSuggestions([]);
+                  setSuggestionsLoading(false);
+                }
+              }}
+              onFocus={() => {
+                if (playerSuggestions.length > 0) setSuggestionsOpen(true);
+              }}
+              onBlur={() => window.setTimeout(() => setSuggestionsOpen(false), 120)}
+              autoComplete="off"
+            />
+            {suggestionsOpen && (playerSuggestions.length > 0 || suggestionsLoading) ? (
+              <div className="absolute left-0 right-0 top-full z-30 mt-2 overflow-hidden rounded-md border border-border bg-card shadow-xl">
+                {suggestionsLoading ? (
+                  <div className="px-4 py-3 text-sm text-muted-foreground">Searching...</div>
+                ) : (
+                  playerSuggestions.map((name) => (
+                    <button
+                      key={name}
+                      type="button"
+                      className="block w-full px-4 py-3 text-left text-sm font-semibold text-foreground hover:bg-muted focus:bg-muted focus:outline-none"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        selectPlayerSuggestion(name);
+                      }}
+                    >
+                      {name}
+                    </button>
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
           <button className="btn-primary" type="submit">Analyze</button>
         </form>
         {playerPerformance ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
-            <div className="p-4 rounded-xl border border-border bg-muted/10">
-              <p className="text-xs text-muted-foreground uppercase font-semibold">Expected Goals</p>
-              <p className="text-2xl font-bold text-primary">{playerPerformance.expected_goals}</p>
+          <div className="mt-4 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="p-4 rounded-xl border border-border bg-muted/10">
+                <p className="text-xs text-muted-foreground uppercase font-semibold">Expected Goals</p>
+                <p className="text-2xl font-bold text-primary">{playerPerformance.expected_goals}</p>
+              </div>
+              <div className="p-4 rounded-xl border border-border bg-muted/10">
+                <p className="text-xs text-muted-foreground uppercase font-semibold">Expected Assists</p>
+                <p className="text-2xl font-bold text-primary">{playerPerformance.expected_assists}</p>
+              </div>
+              <div className="p-4 rounded-xl border border-border bg-muted/10">
+                <p className="text-xs text-muted-foreground uppercase font-semibold">Confidence</p>
+                <p className="text-2xl font-bold text-primary">{Math.round((playerPerformance.confidence || 0) * 100)}%</p>
+              </div>
             </div>
-            <div className="p-4 rounded-xl border border-border bg-muted/10">
-              <p className="text-xs text-muted-foreground uppercase font-semibold">Expected Assists</p>
-              <p className="text-2xl font-bold text-primary">{playerPerformance.expected_assists}</p>
-            </div>
-            <div className="p-4 rounded-xl border border-border bg-muted/10">
-              <p className="text-xs text-muted-foreground uppercase font-semibold">Confidence</p>
-              <p className="text-2xl font-bold text-primary">{Math.round((playerPerformance.confidence || 0) * 100)}%</p>
-            </div>
+
+            {similarPlayers.length > 0 ? (
+              <div className="rounded-xl border border-border bg-muted/10 p-4">
+                <p className="text-xs text-muted-foreground uppercase font-semibold">Similar Player Profiles</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {similarPlayers.map((name) => (
+                    <span
+                      key={name}
+                      className="rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-sm font-semibold text-primary"
+                    >
+                      {name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

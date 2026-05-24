@@ -160,12 +160,12 @@ export default function AdminLeaderboardPage() {
             <div className="bg-green-50 border border-green-200 rounded-lg p-6">
               <h3 className="text-lg font-semibold text-green-900 mb-2">System Controls</h3>
               <p className="text-green-800 text-sm mb-4">
-                Use the admin controls to sync and verify player points from match data.
+                Use the admin controls to recalculate and verify fantasy point totals.
               </p>
               <ul className="text-green-700 text-sm space-y-1">
                 <li>✓ Recalculate fantasy points</li>
                 <li>✓ Verify ranking integrity</li>
-                <li>✓ Sync match results</li>
+                <li>✓ Hide admin accounts from rankings</li>
               </ul>
             </div>
           </div>

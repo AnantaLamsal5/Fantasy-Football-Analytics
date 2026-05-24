@@ -2,6 +2,8 @@
 
 import { useState, useContext, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { Eye, EyeOff } from 'lucide-react';
 import { AdminAuthContext } from '@/context/AdminAuthContext';
 
 export default function AdminLoginPage() {
@@ -9,6 +11,7 @@ export default function AdminLoginPage() {
   const { loginAdmin, isAdminAuthenticated, adminLoading, adminError: contextError } = useContext(AdminAuthContext);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -36,32 +39,32 @@ export default function AdminLoginPage() {
 
   if (adminLoading) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      <div className="flex min-h-[60vh] items-center justify-center">
         <div className="text-center">
           <div className="mb-4">
-            <div className="inline-block w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+            <div className="inline-block h-12 w-12 animate-spin rounded-full border-4 border-primary border-t-transparent" />
           </div>
-          <p className="text-gray-600 text-lg">Loading...</p>
+          <p className="text-lg text-muted-foreground">Loading...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center p-4">
+    <div className="flex min-h-[70vh] items-center justify-center p-4">
       <div className="w-full max-w-md">
         {/* Header */}
         <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-gray-900 mb-2">Admin Portal</h1>
-          <p className="text-gray-600">Fantasy Football Analytics</p>
+          <h1 className="mb-2 text-4xl font-bold text-foreground">Admin Portal</h1>
+          <p className="text-muted-foreground">Fantasy Football Analytics</p>
         </div>
 
         {/* Card */}
-        <div className="bg-white rounded-xl shadow-lg p-8">
+        <div className="card p-8">
           {/* Error Message */}
           {error && (
-            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-red-700 text-sm font-medium">{error}</p>
+            <div className="mb-6 rounded-lg border border-destructive/20 bg-destructive/10 p-4">
+              <p className="text-sm font-medium text-destructive">{error}</p>
             </div>
           )}
 
@@ -69,7 +72,7 @@ export default function AdminLoginPage() {
           <form onSubmit={handleSubmit} className="space-y-6">
             {/* Email Field */}
             <div>
-              <label htmlFor="email" className="block text-sm font-semibold text-gray-700 mb-2">
+              <label htmlFor="email" className="mb-2 block text-sm font-semibold text-foreground">
                 Admin Email
               </label>
               <input
@@ -78,52 +81,59 @@ export default function AdminLoginPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="Enter admin email"
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-colors"
+                className="w-full rounded-md border border-border bg-input px-4 py-3 text-foreground placeholder:text-muted-foreground outline-none transition-colors focus:ring-2 focus:ring-primary/30"
                 required
               />
             </div>
 
             {/* Password Field */}
             <div>
-              <label htmlFor="password" className="block text-sm font-semibold text-gray-700 mb-2">
+              <label htmlFor="password" className="mb-2 block text-sm font-semibold text-foreground">
                 Password
               </label>
-              <input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password"
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-colors"
-                required
-              />
+              <div className="relative">
+                <input
+                  id="password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter password"
+                  className="w-full rounded-md border border-border bg-input px-4 py-3 pr-12 text-foreground placeholder:text-muted-foreground outline-none transition-colors focus:ring-2 focus:ring-primary/30"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((current) => !current)}
+                  className="absolute right-2 top-1/2 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-md text-primary transition-colors hover:bg-primary/10"
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
             </div>
 
             {/* Submit Button */}
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-3 rounded-lg transition-colors duration-200"
+              className="btn-primary w-full py-3 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {loading ? 'Logging in...' : 'Login as Admin'}
             </button>
           </form>
 
-          <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-            <p className="text-xs text-blue-700 font-medium">
+          <div className="mt-6 rounded-lg border border-primary/20 bg-primary/10 p-4">
+            <p className="text-xs font-medium text-primary">
               Admin access uses your backend staff account credentials.
             </p>
           </div>
         </div>
 
-        {/* Footer */}
-        <div className="text-center mt-6">
-          <p className="text-gray-600 text-sm">
-            Not an admin?{' '}
-            <a href="/login" className="text-blue-600 hover:text-blue-700 font-semibold">
-              User Login
-            </a>
-          </p>
+        <div className="mt-6 text-center text-sm text-muted-foreground">
+          Not an admin?{' '}
+          <Link href="/login" className="font-semibold text-primary hover:underline">
+            User login
+          </Link>
         </div>
       </div>
     </div>

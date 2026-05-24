@@ -10,7 +10,6 @@ export const APP_ROUTES = {
   leaderboard: "/leaderboard",
   predictions: "/predictions",
   team: "/teams",
-  matches: "/matches",
   transfers: "/transfers",
   admin: "/admin",
 };

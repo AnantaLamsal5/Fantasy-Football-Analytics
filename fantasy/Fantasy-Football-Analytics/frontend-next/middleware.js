@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-const PROTECTED_PREFIXES = ["/dashboard", "/leaderboard", "/predictions", "/teams", "/matches", "/transfers", "/profile"];
+const PROTECTED_PREFIXES = ["/dashboard", "/leaderboard", "/predictions", "/teams", "/transfers", "/profile"];
 const ADMIN_PREFIX = "/admin";
 
 function decodeJWT(token) {
@@ -60,5 +60,5 @@ export function middleware(request) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/leaderboard/:path*", "/predictions/:path*", "/teams/:path*", "/matches/:path*", "/transfers/:path*", "/profile/:path*", "/admin/:path*"],
+  matcher: ["/dashboard/:path*", "/leaderboard/:path*", "/predictions/:path*", "/teams/:path*", "/transfers/:path*", "/profile/:path*", "/admin/:path*"],
 };

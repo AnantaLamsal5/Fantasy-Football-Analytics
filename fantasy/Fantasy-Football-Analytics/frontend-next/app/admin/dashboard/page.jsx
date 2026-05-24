@@ -1,58 +1,44 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import ProtectedAdminRoute from '@/components/ProtectedAdminRoute';
-import AdminSidebar from '@/components/AdminSidebar';
-import { API_BASE_URL } from '@/utils/constants';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import AdminSidebar from '@/components/AdminSidebar';
+import ProtectedAdminRoute from '@/components/ProtectedAdminRoute';
+import { API_BASE_URL } from '@/utils/constants';
 
 export default function AdminDashboardPage() {
   const [stats, setStats] = useState({
     totalUsers: 0,
     totalPlayers: 0,
-    totalMatches: 0,
     totalTransfers: 0,
     recentUsers: [],
-    recentMatches: [],
     apiStatus: 'checking',
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-
-  useEffect(() => {
-    fetchDashboardData();
-  }, []);
 
   async function fetchDashboardData() {
     setLoading(true);
     setError('');
 
     try {
-      // Fetch users
-      const usersRes = await fetch(`${API_BASE_URL}/api/admin/users/`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('ff_admin_token')}` }
-      });
-      const usersData = usersRes.ok ? (await usersRes.json()) : [];
+      const token = localStorage.getItem('ff_admin_token');
+      const headers = { Authorization: `Bearer ${token}` };
+      const [usersRes, playersRes, transfersRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/admin/users/`, { headers }),
+        fetch(`${API_BASE_URL}/api/admin/players/`, { headers }),
+        fetch(`${API_BASE_URL}/api/admin/transfers/`, { headers }),
+      ]);
 
-      // Fetch players
-      const playersRes = await fetch(`${API_BASE_URL}/api/admin/players/`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('ff_admin_token')}` }
-      });
-      const playersData = playersRes.ok ? (await playersRes.json()) : [];
-
-      // Fetch matches
-      const matchesRes = await fetch(`${API_BASE_URL}/api/admin/matches/`, {
-        headers: { 'Authorization': `Bearer ${localStorage.getItem('ff_admin_token')}` }
-      });
-      const matchesData = matchesRes.ok ? (await matchesRes.json()) : [];
+      const usersData = usersRes.ok ? await usersRes.json() : [];
+      const playersData = playersRes.ok ? await playersRes.json() : [];
+      const transfersData = transfersRes.ok ? await transfersRes.json() : [];
 
       setStats({
         totalUsers: Array.isArray(usersData) ? usersData.length : 0,
         totalPlayers: Array.isArray(playersData) ? playersData.length : 0,
-        totalMatches: Array.isArray(matchesData) ? matchesData.length : 0,
-        totalTransfers: 0, // Placeholder
+        totalTransfers: Array.isArray(transfersData) ? transfersData.length : 0,
         recentUsers: Array.isArray(usersData) ? usersData.slice(0, 5) : [],
-        recentMatches: Array.isArray(matchesData) ? matchesData.slice(0, 5) : [],
         apiStatus: 'online',
       });
     } catch (err) {
@@ -64,166 +50,99 @@ export default function AdminDashboardPage() {
     }
   }
 
+  useEffect(() => {
+    Promise.resolve().then(fetchDashboardData);
+  }, []);
+
+  const statCards = [
+    { label: 'Total Users', value: stats.totalUsers, href: '/admin/users' },
+    { label: 'Total Players', value: stats.totalPlayers, href: '/admin/players' },
+    { label: 'Transfers', value: stats.totalTransfers, href: '/admin/transfers' },
+    { label: 'System Status', value: stats.apiStatus, href: null },
+  ];
+
   return (
     <ProtectedAdminRoute>
-      <div className="flex min-h-screen bg-gray-100">
-        {/* Sidebar */}
+      <div className="flex min-h-screen bg-background">
         <AdminSidebar />
 
-        {/* Main Content */}
         <main className="flex-1 p-8">
-          {/* Header */}
           <div className="mb-8">
-            <h1 className="text-4xl font-bold text-gray-900 mb-2">Dashboard</h1>
-            <p className="text-gray-600">Welcome to the Fantasy Football Admin Panel</p>
+            <h1 className="mb-2 text-4xl font-bold text-foreground">Dashboard</h1>
+            <p className="text-muted-foreground">Fantasy Football admin workspace</p>
           </div>
 
-          {/* Error Message */}
           {error && (
-            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-red-700 font-medium">{error}</p>
+            <div className="mb-6 rounded-lg border border-destructive/20 bg-destructive/10 p-4">
+              <p className="font-medium text-destructive">{error}</p>
               <button
                 onClick={fetchDashboardData}
-                className="mt-2 text-red-600 hover:text-red-700 font-semibold text-sm"
+                className="mt-2 text-sm font-semibold text-destructive hover:underline"
+                type="button"
               >
                 Try again
               </button>
             </div>
           )}
 
-          {/* Stats Grid */}
           {loading ? (
-            <div className="text-center py-12">
-              <div className="inline-block w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              <p className="mt-4 text-gray-600">Loading dashboard...</p>
+            <div className="py-12 text-center">
+              <div className="inline-block h-12 w-12 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+              <p className="mt-4 text-muted-foreground">Loading dashboard...</p>
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-                {/* Total Users */}
-                <Link href="/admin/users">
-                  <div className="bg-white rounded-lg shadow p-6 hover:shadow-lg hover:scale-105 transition-transform cursor-pointer">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-gray-600 text-sm font-medium">Total Users</p>
-                        <p className="text-3xl font-bold text-gray-900 mt-2">{stats.totalUsers}</p>
-                      </div>
-                      <div className="text-4xl">👥</div>
+              <div className="mb-8 grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-4">
+                {statCards.map((card) => {
+                  const body = (
+                    <div className="card p-6 transition-colors hover:bg-muted/40">
+                      <p className="text-sm font-medium text-muted-foreground">{card.label}</p>
+                      <p className="mt-2 text-3xl font-bold text-foreground capitalize">{card.value}</p>
                     </div>
-                  </div>
-                </Link>
+                  );
 
-                {/* Total Players */}
-                <Link href="/admin/players">
-                  <div className="bg-white rounded-lg shadow p-6 hover:shadow-lg hover:scale-105 transition-transform cursor-pointer">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-gray-600 text-sm font-medium">Total Players</p>
-                        <p className="text-3xl font-bold text-gray-900 mt-2">{stats.totalPlayers}</p>
-                      </div>
-                      <div className="text-4xl">⚽</div>
-                    </div>
-                  </div>
-                </Link>
-
-                {/* Total Matches */}
-                <Link href="/admin/matches">
-                  <div className="bg-white rounded-lg shadow p-6 hover:shadow-lg hover:scale-105 transition-transform cursor-pointer">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-gray-600 text-sm font-medium">Total Matches</p>
-                        <p className="text-3xl font-bold text-gray-900 mt-2">{stats.totalMatches}</p>
-                      </div>
-                      <div className="text-4xl">🏆</div>
-                    </div>
-                  </div>
-                </Link>
-
-                {/* API Status */}
-                <div className="bg-white rounded-lg shadow p-6">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="text-gray-600 text-sm font-medium">System Status</p>
-                      <div className="mt-2 flex items-center gap-2">
-                        <div className={`w-3 h-3 rounded-full ${stats.apiStatus === 'online' ? 'bg-green-500' : 'bg-red-500'}`} />
-                        <p className="text-lg font-bold text-gray-900 capitalize">{stats.apiStatus}</p>
-                      </div>
-                    </div>
-                    <div className="text-4xl">{stats.apiStatus === 'online' ? '✅' : '❌'}</div>
-                  </div>
-                </div>
+                  return card.href ? (
+                    <Link key={card.label} href={card.href}>
+                      {body}
+                    </Link>
+                  ) : (
+                    <div key={card.label}>{body}</div>
+                  );
+                })}
               </div>
 
-              {/* Quick Actions */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                <Link
-                  href="/admin/players"
-                  className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow p-6 transition-colors"
-                >
-                  <p className="text-2xl mb-2">⚽</p>
-                  <h3 className="text-xl font-bold mb-1">Manage Players</h3>
-                  <p className="text-blue-100 text-sm">Add, edit, or delete players</p>
+              <div className="mb-8 grid grid-cols-1 gap-6 md:grid-cols-3">
+                <Link href="/admin/players" className="card p-6 transition-colors hover:bg-muted/40">
+                  <h3 className="mb-1 text-xl font-bold">Manage Players</h3>
+                  <p className="text-sm text-muted-foreground">Add, edit, ban, or delete players.</p>
                 </Link>
 
-                <Link
-                  href="/admin/matches"
-                  className="bg-purple-600 hover:bg-purple-700 text-white rounded-lg shadow p-6 transition-colors"
-                >
-                  <p className="text-2xl mb-2">🏆</p>
-                  <h3 className="text-xl font-bold mb-1">Manage Matches</h3>
-                  <p className="text-purple-100 text-sm">Manage match schedules and results</p>
+                <Link href="/admin/users" className="card p-6 transition-colors hover:bg-muted/40">
+                  <h3 className="mb-1 text-xl font-bold">Manage Users</h3>
+                  <p className="text-sm text-muted-foreground">Promote admins and remove registered users.</p>
                 </Link>
 
-                <Link
-                  href="/admin/users"
-                  className="bg-green-600 hover:bg-green-700 text-white rounded-lg shadow p-6 transition-colors"
-                >
-                  <p className="text-2xl mb-2">👥</p>
-                  <h3 className="text-xl font-bold mb-1">Manage Users</h3>
-                  <p className="text-green-100 text-sm">View and manage user accounts</p>
+                <Link href="/admin/leaderboard" className="card p-6 transition-colors hover:bg-muted/40">
+                  <h3 className="mb-1 text-xl font-bold">Leaderboard</h3>
+                  <p className="text-sm text-muted-foreground">Review regular-user rankings.</p>
                 </Link>
               </div>
 
-              {/* Recent Data */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                {/* Recent Users */}
-                <div className="bg-white rounded-lg shadow">
-                  <div className="px-6 py-4 border-b border-gray-200">
-                    <h3 className="text-lg font-bold text-gray-900">Recent Users</h3>
-                  </div>
-                  <div className="divide-y">
-                    {stats.recentUsers.length > 0 ? (
-                      stats.recentUsers.map((user, idx) => (
-                        <div key={idx} className="px-6 py-4 hover:bg-gray-50">
-                          <p className="font-semibold text-gray-900">{user.username || user.email || 'Unknown'}</p>
-                          <p className="text-sm text-gray-600">{user.email}</p>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="px-6 py-4 text-center text-gray-600">No users found</div>
-                    )}
-                  </div>
+              <div className="card">
+                <div className="border-b border-border/60 px-6 py-4">
+                  <h3 className="text-lg font-bold">Recent Users</h3>
                 </div>
-
-                {/* Recent Matches */}
-                <div className="bg-white rounded-lg shadow">
-                  <div className="px-6 py-4 border-b border-gray-200">
-                    <h3 className="text-lg font-bold text-gray-900">Recent Matches</h3>
-                  </div>
-                  <div className="divide-y">
-                    {stats.recentMatches.length > 0 ? (
-                      stats.recentMatches.map((match, idx) => (
-                        <div key={idx} className="px-6 py-4 hover:bg-gray-50">
-                          <p className="font-semibold text-gray-900">
-                            {match.home_team} vs {match.away_team}
-                          </p>
-                          <p className="text-sm text-gray-600">Matchweek {match.matchday}</p>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="px-6 py-4 text-center text-gray-600">No matches found</div>
-                    )}
-                  </div>
+                <div className="divide-y divide-border/40">
+                  {stats.recentUsers.length > 0 ? (
+                    stats.recentUsers.map((user) => (
+                      <div key={user.id || user.email} className="px-6 py-4 hover:bg-muted/30">
+                        <p className="font-semibold text-foreground">{user.username || user.email || 'Unknown'}</p>
+                        <p className="text-sm text-muted-foreground">{user.email}</p>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="px-6 py-4 text-center text-muted-foreground">No users found</div>
+                  )}
                 </div>
               </div>
             </>

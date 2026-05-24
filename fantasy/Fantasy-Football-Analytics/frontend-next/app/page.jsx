@@ -111,7 +111,7 @@ export default function Home() {
               Fantasy Football
             </div>
             <p>
-              AI-assisted fantasy football analytics for squads, fixtures, rankings, and smarter transfer decisions.
+              AI-assisted fantasy football analytics for squads, rankings, and smarter transfer decisions.
             </p>
           </div>
           <div>
@@ -123,7 +123,7 @@ export default function Home() {
               </div>
               <div className="flex items-start gap-3">
                 <Radio className="mt-0.5 h-4 w-4 text-primary" />
-                <p>Follow match updates and fixture difficulty in one place.</p>
+                <p>Use AI-assisted insights to compare squad and transfer choices.</p>
               </div>
               <div className="flex items-start gap-3">
                 <Users className="mt-0.5 h-4 w-4 text-primary" />

@@ -1,36 +1,64 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import ProtectedAdminRoute from '@/components/ProtectedAdminRoute';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import AdminSidebar from '@/components/AdminSidebar';
+import ProtectedAdminRoute from '@/components/ProtectedAdminRoute';
 import { API_BASE_URL } from '@/utils/constants';
+
+const initialForm = {
+  ban_mode: 'none',
+  ban_duration_weeks: '1',
+  ban_starts_at: '',
+  ban_expires_at: '',
+  ban_reason: '',
+};
+
+function getAdminToken() {
+  return typeof window !== 'undefined' ? localStorage.getItem('ff_admin_token') || '' : '';
+}
+
+function toDateTimeLocal(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function toApiDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function readError(response, fallback) {
+  try {
+    const payload = await response.json();
+    return payload?.detail || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 export default function AdminPlayersPage() {
   const [players, setPlayers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [editingPlayer, setEditingPlayer] = useState(null);
-  const [formData, setFormData] = useState({
-    name: '',
-    position: 'Midfielder',
-    team_name: '',
-    cost: '5000000',
-    nationality: '',
-  });
+  const [formData, setFormData] = useState(initialForm);
 
-  const adminToken = typeof window !== 'undefined' ? localStorage.getItem('ff_admin_token') : '';
-
-  async function fetchPlayers() {
+  const fetchPlayers = useCallback(async () => {
     setLoading(true);
     setError('');
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/admin/players/`, {
-        headers: { 'Authorization': `Bearer ${adminToken}` }
+        headers: { Authorization: `Bearer ${getAdminToken()}` },
       });
 
-      if (!response.ok) throw new Error('Failed to fetch players');
+      if (!response.ok) throw new Error(await readError(response, 'Failed to fetch players'));
       const data = await response.json();
       setPlayers(Array.isArray(data) ? data : []);
     } catch (err) {
@@ -39,232 +67,300 @@ export default function AdminPlayersPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     Promise.resolve().then(fetchPlayers);
-  }, []);
+  }, [fetchPlayers]);
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  const bannedCount = useMemo(() => players.filter((player) => player.is_banned).length, [players]);
+
+  function playerPayload() {
+    const payload = {};
+
+    if (formData.ban_mode === 'none') {
+      payload.clear_ban = true;
+    } else if (formData.ban_mode === 'weeks') {
+      payload.ban_duration_weeks = formData.ban_duration_weeks;
+      payload.ban_reason = formData.ban_reason;
+    } else {
+      payload.ban_starts_at = toApiDateTime(formData.ban_starts_at);
+      payload.ban_expires_at = toApiDateTime(formData.ban_expires_at);
+      payload.ban_reason = formData.ban_reason;
+    }
+
+    return payload;
+  }
+
+  async function handleSubmit(event) {
+    event.preventDefault();
     setError('');
+    setSuccess('');
+
+    if (!editingPlayer) return;
 
     try {
-      const url = editingPlayer
-        ? `${API_BASE_URL}/api/admin/players/${editingPlayer.id}/`
-        : `${API_BASE_URL}/api/admin/players/`;
-
-      const method = editingPlayer ? 'PATCH' : 'POST';
-
-      const response = await fetch(url, {
-        method,
+      const response = await fetch(`${API_BASE_URL}/api/admin/players/${editingPlayer.id}/`, {
+        method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
+          Authorization: `Bearer ${getAdminToken()}`,
         },
-        body: JSON.stringify(formData),
+        body: JSON.stringify(playerPayload()),
       });
 
-      if (!response.ok) throw new Error('Failed to save player');
-
+      if (!response.ok) throw new Error(await readError(response, 'Failed to save player'));
       const savedPlayer = await response.json();
 
-      if (editingPlayer) {
-        setPlayers((prev) =>
-          prev.map((p) => (p.id === editingPlayer.id ? savedPlayer : p))
-        );
-      } else {
-        setPlayers((prev) => [savedPlayer, ...prev]);
-      }
-
+      setPlayers((prev) => prev.map((player) => (player.id === editingPlayer.id ? savedPlayer : player)));
+      setSuccess(`${savedPlayer.name} ban settings were updated.`);
       resetForm();
     } catch (err) {
       setError(err.message || 'Failed to save player');
     }
-  };
+  }
 
-  const handleDelete = async (playerId) => {
-    if (!confirm('Are you sure you want to delete this player?')) return;
+  async function updateBan(player, payload) {
+    setError('');
+    setSuccess('');
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/admin/players/${playerId}/`, {
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${adminToken}` }
+      const response = await fetch(`${API_BASE_URL}/api/admin/players/${player.id}/`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${getAdminToken()}`,
+        },
+        body: JSON.stringify(payload),
       });
 
-      if (!response.ok) throw new Error('Failed to delete player');
-
-      setPlayers((prev) => prev.filter((p) => p.id !== playerId));
+      if (!response.ok) throw new Error(await readError(response, 'Failed to update ban'));
+      const updatedPlayer = await response.json();
+      setPlayers((prev) => prev.map((item) => (item.id === player.id ? updatedPlayer : item)));
+      setSuccess(payload.clear_ban ? `${player.name} is available again.` : `${player.name} was banned.`);
     } catch (err) {
-      setError(err.message || 'Failed to delete player');
+      setError(err.message || 'Failed to update ban');
     }
-  };
+  }
 
-  const resetForm = () => {
-    setFormData({ name: '', position: 'Midfielder', team_name: '', cost: '5000000', nationality: '' });
+  function resetForm() {
+    setFormData(initialForm);
     setEditingPlayer(null);
     setShowForm(false);
-  };
+  }
 
-  const handleEdit = (player) => {
+  function handleManageBan(player) {
     setFormData({
-      name: player.name,
-      position: player.position,
-      team_name: player.team,
-      cost: player.value.toString(),
-      nationality: player.nationality || '',
+      ban_mode: player.ban_expires_at ? 'custom' : 'none',
+      ban_duration_weeks: '1',
+      ban_starts_at: toDateTimeLocal(player.ban_starts_at),
+      ban_expires_at: toDateTimeLocal(player.ban_expires_at),
+      ban_reason: player.ban_reason || '',
     });
     setEditingPlayer(player);
     setShowForm(true);
-  };
+  }
+
+  function formatBan(player) {
+    if (!player.ban_expires_at) return 'Available';
+    const expires = new Date(player.ban_expires_at);
+    const label = Number.isNaN(expires.getTime()) ? 'Banned' : `Until ${expires.toLocaleString()}`;
+    return player.is_banned ? label : `Expired ${expires.toLocaleDateString()}`;
+  }
 
   return (
     <ProtectedAdminRoute>
-      <div className="flex min-h-screen bg-gray-100">
+      <div className="flex min-h-screen bg-background">
         <AdminSidebar />
 
         <main className="flex-1 p-8">
-          <div className="mb-8 flex justify-between items-center">
+          <div className="mb-8 flex items-center justify-between gap-4">
             <div>
-              <h1 className="text-4xl font-bold text-gray-900">Players</h1>
-              <p className="text-gray-600">Manage fantasy football players</p>
+              <h1 className="text-4xl font-bold text-foreground">Players</h1>
+              <p className="text-muted-foreground">Manage players and temporary ban availability.</p>
             </div>
-            <button
-              onClick={() => (showForm ? resetForm() : setShowForm(true))}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
-            >
-              {showForm ? 'Cancel' : 'Add Player'}
-            </button>
+          </div>
+
+          <div className="mb-6 grid gap-4 md:grid-cols-3">
+            <div className="card p-5">
+              <p className="text-sm font-semibold text-muted-foreground">Total Players</p>
+              <p className="mt-2 text-3xl font-bold">{players.length}</p>
+            </div>
+            <div className="card p-5">
+              <p className="text-sm font-semibold text-muted-foreground">Banned</p>
+              <p className="mt-2 text-3xl font-bold text-destructive">{bannedCount}</p>
+            </div>
+            <div className="card p-5">
+              <p className="text-sm font-semibold text-muted-foreground">Available</p>
+              <p className="mt-2 text-3xl font-bold text-green-500">{players.length - bannedCount}</p>
+            </div>
           </div>
 
           {error && (
-            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-red-700 font-medium">{error}</p>
+            <div className="mb-6 rounded-lg border border-destructive/20 bg-destructive/10 p-4">
+              <p className="font-medium text-destructive">{error}</p>
             </div>
           )}
 
-          {/* Add/Edit Form */}
+          {success && (
+            <div className="mb-6 rounded-lg border border-green-500/20 bg-green-500/10 p-4">
+              <p className="font-medium text-green-400">{success}</p>
+            </div>
+          )}
+
           {showForm && (
-            <div className="bg-white rounded-lg shadow p-6 mb-8">
-              <h2 className="text-2xl font-bold text-gray-900 mb-6">
-                {editingPlayer ? 'Edit Player' : 'Add New Player'}
-              </h2>
+            <div className="card mb-8 p-6">
+              <div className="mb-6 flex items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-2xl font-bold">Manage Player Ban</h2>
+                  {editingPlayer ? (
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      {editingPlayer.name} · {editingPlayer.position} · {editingPlayer.team}
+                    </p>
+                  ) : null}
+                </div>
+                <button onClick={resetForm} className="font-semibold text-muted-foreground hover:text-foreground" type="button">
+                  Cancel
+                </button>
+              </div>
 
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Name</label>
-                    <input
-                      type="text"
-                      value={formData.name}
-                      onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                      required
-                    />
-                  </div>
+              <form onSubmit={handleSubmit} className="space-y-5">
+                <div className="rounded-lg border border-border/60 p-4">
+                  <h3 className="mb-4 font-bold">Temporary Ban</h3>
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <label className="block text-sm font-semibold">
+                      Ban Type
+                      <select
+                        value={formData.ban_mode}
+                        onChange={(event) => setFormData({ ...formData, ban_mode: event.target.value })}
+                        className="mt-2 w-full rounded-md border border-border bg-input px-4 py-2 text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                      >
+                        <option value="none">No ban</option>
+                        <option value="weeks">Weekly duration</option>
+                        <option value="custom">Custom date range</option>
+                      </select>
+                    </label>
 
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Position</label>
-                    <select
-                      value={formData.position}
-                      onChange={(e) => setFormData({ ...formData, position: e.target.value })}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                      required
-                    >
-                      <option value="Goalkeeper">Goalkeeper</option>
-                      <option value="Defender">Defender</option>
-                      <option value="Midfielder">Midfielder</option>
-                      <option value="Attacker">Attacker</option>
-                    </select>
-                  </div>
+                    {formData.ban_mode === 'weeks' && (
+                      <label className="block text-sm font-semibold">
+                        Duration (weeks)
+                        <input
+                          type="number"
+                          min="1"
+                          value={formData.ban_duration_weeks}
+                          onChange={(event) => setFormData({ ...formData, ban_duration_weeks: event.target.value })}
+                          className="mt-2 w-full rounded-md border border-border bg-input px-4 py-2 text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                    )}
 
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Team</label>
-                    <input
-                      type="text"
-                      value={formData.team_name}
-                      onChange={(e) => setFormData({ ...formData, team_name: e.target.value })}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                      required
-                    />
-                  </div>
+                    {formData.ban_mode === 'custom' && (
+                      <>
+                        <label className="block text-sm font-semibold">
+                          Starts At
+                          <input
+                            type="datetime-local"
+                            value={formData.ban_starts_at}
+                            onChange={(event) => setFormData({ ...formData, ban_starts_at: event.target.value })}
+                            className="mt-2 w-full rounded-md border border-border bg-input px-4 py-2 text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                          />
+                        </label>
 
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Cost</label>
-                    <input
-                      type="number"
-                      value={formData.cost}
-                      onChange={(e) => setFormData({ ...formData, cost: e.target.value })}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                      required
-                    />
-                  </div>
+                        <label className="block text-sm font-semibold">
+                          Expires At
+                          <input
+                            type="datetime-local"
+                            value={formData.ban_expires_at}
+                            onChange={(event) => setFormData({ ...formData, ban_expires_at: event.target.value })}
+                            className="mt-2 w-full rounded-md border border-border bg-input px-4 py-2 text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                          />
+                        </label>
+                      </>
+                    )}
 
-                  <div className="md:col-span-2">
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">Nationality</label>
-                    <input
-                      type="text"
-                      value={formData.nationality}
-                      onChange={(e) => setFormData({ ...formData, nationality: e.target.value })}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
+                    {formData.ban_mode !== 'none' && (
+                      <label className="block text-sm font-semibold md:col-span-2">
+                        Reason
+                        <input
+                          type="text"
+                          value={formData.ban_reason}
+                          onChange={(event) => setFormData({ ...formData, ban_reason: event.target.value })}
+                          className="mt-2 w-full rounded-md border border-border bg-input px-4 py-2 text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                          placeholder="Optional reason"
+                        />
+                      </label>
+                    )}
                   </div>
                 </div>
 
-                <button
-                  type="submit"
-                  className="bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
-                >
-                  {editingPlayer ? 'Update Player' : 'Create Player'}
+                <button type="submit" className="btn-primary px-6">
+                  Update Ban
                 </button>
               </form>
             </div>
           )}
 
-          {/* Players Table */}
           {loading ? (
-            <div className="text-center py-12">
-              <div className="inline-block w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              <p className="mt-4 text-gray-600">Loading players...</p>
+            <div className="py-12 text-center">
+              <div className="inline-block h-12 w-12 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+              <p className="mt-4 text-muted-foreground">Loading players...</p>
             </div>
           ) : players.length === 0 ? (
-            <div className="bg-white rounded-lg shadow p-8 text-center">
-              <p className="text-gray-600 text-lg">No players found</p>
+            <div className="card p-8 text-center">
+              <p className="text-lg text-muted-foreground">No players found</p>
             </div>
           ) : (
-            <div className="bg-white rounded-lg shadow overflow-x-auto">
+            <div className="overflow-x-auto rounded-lg border border-border/40 bg-card shadow">
               <table className="w-full">
-                <thead className="bg-gray-50 border-b border-gray-200">
+                <thead className="border-b border-border/60 bg-muted/30">
                   <tr>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Name</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Position</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Team</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Cost</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Nationality</th>
-                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Actions</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Name</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Position</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Team</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Cost</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Ban Status</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-muted-foreground">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y">
+                <tbody className="divide-y divide-border/40">
                   {players.map((player) => (
-                    <tr key={player.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 text-sm text-gray-900 font-semibold">{player.name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{player.position}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{player.team}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">€{(player.value / 1000000).toFixed(2)}M</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{player.nationality || '-'}</td>
-                      <td className="px-6 py-4 text-sm space-x-2">
-                        <button
-                          onClick={() => handleEdit(player)}
-                          className="text-blue-600 hover:text-blue-700 font-semibold"
+                    <tr key={player.id} className="hover:bg-muted/30">
+                      <td className="px-6 py-4 text-sm font-semibold text-foreground">{player.name}</td>
+                      <td className="px-6 py-4 text-sm text-muted-foreground">{player.position}</td>
+                      <td className="px-6 py-4 text-sm text-muted-foreground">{player.team}</td>
+                      <td className="px-6 py-4 text-sm text-muted-foreground">EUR {(player.value / 1000000).toFixed(2)}M</td>
+                      <td className="px-6 py-4 text-sm">
+                        <span
+                          className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${
+                            player.is_banned ? 'bg-destructive/10 text-destructive' : 'bg-green-500/10 text-green-400'
+                          }`}
                         >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => handleDelete(player.id)}
-                          className="text-red-600 hover:text-red-700 font-semibold"
-                        >
-                          Delete
-                        </button>
+                          {formatBan(player)}
+                        </span>
+                        {player.ban_reason ? (
+                          <p className="mt-1 max-w-56 truncate text-xs text-muted-foreground">{player.ban_reason}</p>
+                        ) : null}
+                      </td>
+                      <td className="px-6 py-4 text-sm">
+                        <div className="flex flex-wrap gap-2">
+                          <button onClick={() => handleManageBan(player)} className="font-semibold text-primary hover:underline" type="button">
+                            Manage Ban
+                          </button>
+                          <button
+                            onClick={() => updateBan(player, { ban_duration_weeks: 1, ban_reason: 'Admin ban' })}
+                            className="font-semibold text-yellow-500 hover:underline"
+                            type="button"
+                          >
+                            Ban 1w
+                          </button>
+                          <button
+                            onClick={() => updateBan(player, { clear_ban: true })}
+                            className="font-semibold text-green-500 hover:underline"
+                            type="button"
+                          >
+                            Clear Ban
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}

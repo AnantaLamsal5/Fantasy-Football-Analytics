@@ -18,20 +18,19 @@ export default function AdminSidebar() {
   const isActive = (path) => pathname === path;
 
   const navItems = [
-    { path: '/admin/dashboard', label: 'Dashboard', icon: '📊' },
-    { path: '/admin/players', label: 'Players', icon: '⚽' },
-    { path: '/admin/matches', label: 'Matches', icon: '🏆' },
-    { path: '/admin/users', label: 'Users', icon: '👥' },
-    { path: '/admin/transfers', label: 'Transfers', icon: '💱' },
-    { path: '/admin/leaderboard', label: 'Leaderboard', icon: '📈' },
+    { path: '/admin/dashboard', label: 'Dashboard' },
+    { path: '/admin/players', label: 'Players' },
+    { path: '/admin/users', label: 'Users' },
+    { path: '/admin/transfers', label: 'Transfers' },
+    { path: '/admin/leaderboard', label: 'Leaderboard' },
   ];
 
   return (
-    <aside className="w-64 bg-gradient-to-b from-blue-900 to-blue-800 text-white min-h-screen flex flex-col shadow-lg">
+    <aside className="w-64 bg-card text-card-foreground min-h-screen flex flex-col border-r border-border/60 shadow-lg">
       {/* Header */}
-      <div className="p-6 border-b border-blue-700">
+      <div className="p-6 border-b border-border/60">
         <h1 className="text-2xl font-bold">Admin Panel</h1>
-        <p className="text-sm text-blue-200 mt-2">{adminAuth?.email}</p>
+        <p className="text-sm text-muted-foreground mt-2">{adminAuth?.email}</p>
       </div>
 
       {/* Navigation */}
@@ -40,23 +39,22 @@ export default function AdminSidebar() {
           <Link
             key={item.path}
             href={item.path}
-            className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+            className={`block px-4 py-3 rounded-lg transition-colors ${
               isActive(item.path)
-                ? 'bg-blue-600 text-white'
-                : 'text-blue-100 hover:bg-blue-700'
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground'
             }`}
           >
-            <span className="text-lg">{item.icon}</span>
             <span className="font-medium">{item.label}</span>
           </Link>
         ))}
       </nav>
 
       {/* Logout */}
-      <div className="p-4 border-t border-blue-700">
+      <div className="p-4 border-t border-border/60">
         <button
           onClick={handleLogout}
-          className="w-full bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors"
+          className="w-full rounded-lg border border-destructive/30 bg-destructive/10 text-destructive font-semibold py-2 px-4 transition-colors hover:bg-destructive hover:text-destructive-foreground"
         >
           Logout
         </button>

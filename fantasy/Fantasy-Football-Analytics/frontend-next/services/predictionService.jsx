@@ -6,16 +6,16 @@ export function getWeekPredictions(matchweek, confidenceThreshold = 0) {
   );
 }
 
-export function getMatchPrediction(matchId) {
-  return apiGet(`/api/predictions/match/${matchId}/`);
-}
-
 export function getMyTeamSuggestions() {
   return apiGet("/api/predictions/my-team/suggestions/");
 }
 
 export function getPlayerPerformance(playerName) {
   return apiGet(`/api/predictions/player/${encodeURIComponent(playerName)}/`);
+}
+
+export function searchPlayerNames(query) {
+  return apiGet(`/api/players/search/?q=${encodeURIComponent(query)}`);
 }
 
 export function getFantasyPointsProjection() {

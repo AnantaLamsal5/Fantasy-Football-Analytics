@@ -3,29 +3,28 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
-import { LayoutDashboard, Users, Trophy, BrainCircuit, LogOut, Menu, User, Calendar, ArrowRightLeft, ShieldCheck, Bell, CheckCheck } from "lucide-react";
-import { Settings } from "lucide-react";
+import { Bell, CheckCheck, Menu, User } from "lucide-react";
 import { API_BASE_URL, APP_ROUTES } from "@/utils/constants";
 import { useAuth } from "@/context/AuthContext";
 import { useRef, useEffect, useState } from "react";
 import { getNotifications, markAllNotificationsRead, markNotificationRead } from "@/services/leaderboardService";
 
 const links = [ 
-  { href: APP_ROUTES.dashboard, label: "Dashboard", icon: LayoutDashboard },
-  { href: APP_ROUTES.team, label: "Team", icon: Users },
-  { href: APP_ROUTES.transfers, label: "Transfers", icon: ArrowRightLeft },
-  { href: APP_ROUTES.matches, label: "Matches", icon: Calendar },
-  { href: APP_ROUTES.leaderboard, label: "Leaderboard", icon: Trophy },
-  { href: APP_ROUTES.predictions, label: "AI Predictions", icon: BrainCircuit },
+  { href: APP_ROUTES.dashboard, label: "Dashboard" },
+  { href: APP_ROUTES.team, label: "Team" },
+  { href: APP_ROUTES.transfers, label: "Transfers" },
+  { href: APP_ROUTES.leaderboard, label: "Leaderboard" },
+  { href: APP_ROUTES.predictions, label: "AI Predictions" },
 ];
 
 const adminLinks = [
-  { href: "/admin/dashboard", label: "Admin", icon: ShieldCheck },
+  { href: "/admin/dashboard", label: "Admin" },
 ];
 
 export default function Navbar() {
   const pathname = usePathname();
   const { isAuthenticated, user, logout } = useAuth();
+  const isAdminRoute = pathname?.startsWith("/admin");
   const profilePicture = user?.profile_picture
     ? user.profile_picture.startsWith("http")
       ? user.profile_picture
@@ -100,6 +99,10 @@ export default function Navbar() {
 
   const unreadCount = notifications.filter((item) => !item.read).length;
 
+  if (isAdminRoute) {
+    return null;
+  }
+
   return (
     <nav className="sticky top-0 z-50 w-full border-b border-border/30 bg-background/95 backdrop-blur supports-backdrop-filter:bg-background/60 shadow-sm">
       <div className="container mx-auto flex h-16 items-center px-4 md:px-8">
@@ -130,24 +133,21 @@ export default function Navbar() {
                   APP_ROUTES.dashboard,
                   APP_ROUTES.team,
                   APP_ROUTES.transfers,
-                  APP_ROUTES.matches,
-                  APP_ROUTES.leaderboard, // Leaderboard is usually protected too
+                  APP_ROUTES.leaderboard,
                   APP_ROUTES.predictions
                 ];
                 return !protectedRoutes.includes(item.href);
               })
               .map((item) => {
-                const Icon = item.icon;
                 const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
                 return (
                   <Link
                     key={item.href}
                     href={item.href}
-                    className={`relative flex items-center space-x-2 smooth-transition ${
+                    className={`relative smooth-transition ${
                       isActive ? "text-foreground" : "text-foreground/70 hover:text-foreground"
                     }`}
                   >
-                    <Icon className="h-4 w-4" />
                     <span>{item.label}</span>
                     {isActive && (
                       <motion.div
@@ -249,24 +249,22 @@ export default function Navbar() {
                       <Link
                         href={APP_ROUTES.profile}
                         onClick={() => setShowProfileMenu(false)}
-                        className="flex items-center gap-2 px-4 py-2 text-sm hover:bg-muted/50"
+                        className="block px-4 py-2 text-sm hover:bg-muted/50"
                       >
-                        <Settings className="h-4 w-4" />
                         Profile Settings
                       </Link>
                       <button
                         onClick={handleLogout}
-                        className="w-full flex items-center gap-2 px-4 py-2 text-sm hover:bg-muted/50 text-left"
+                        className="w-full px-4 py-2 text-sm hover:bg-muted/50 text-left"
                         type="button"
                       >
-                        <LogOut className="h-4 w-4" />
                         Logout
                       </button>
                     </div>
                   ) : null}
                 </div>
               </>
-            ) : (
+            ) : isAdminRoute ? null : (
               <>
                 <Link
                   href={APP_ROUTES.login}
@@ -279,10 +277,10 @@ export default function Navbar() {
                 </Link>
                 <Link
                   href={APP_ROUTES.login}
-                  className="md:hidden flex items-center justify-center rounded-md w-9 h-9 border border-input bg-background/70 hover:bg-background/75 smooth-transition"
+                  className="md:hidden rounded-md border border-input bg-background/70 px-3 py-2 text-sm font-medium hover:bg-background/75 smooth-transition"
                   aria-label="Open menu"
                 >
-                  <User className="h-4 w-4" />
+                  Log in
                 </Link>
               </>
             )}

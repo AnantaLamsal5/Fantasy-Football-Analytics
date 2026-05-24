@@ -90,6 +90,9 @@ class Player(models.Model):
     team_name = models.CharField(max_length=150, blank=True)
     team_api_id = models.IntegerField(null=True, blank=True)
     cost = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('5000000.00'))
+    ban_starts_at = models.DateTimeField(null=True, blank=True)
+    ban_expires_at = models.DateTimeField(null=True, blank=True)
+    ban_reason = models.CharField(max_length=250, blank=True, default='')
 
     class Meta:
         db_table = 'Players'

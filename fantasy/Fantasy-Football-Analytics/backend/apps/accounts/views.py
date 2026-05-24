@@ -14,6 +14,7 @@ from django.core.files.storage import FileSystemStorage
 from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
 from django.utils.dateparse import parse_datetime
 from django.core.mail import send_mail
 from django.conf import settings
@@ -82,7 +83,23 @@ def _user_payload(user, request=None):
     }
 
 
+def _admin_user_payload(user):
+    return {
+        'id': str(user.pk),
+        'email': user.email,
+        'username': user.username,
+        'role': 'admin' if user.is_staff else 'user',
+        'is_staff': user.is_staff,
+        'is_active': user.is_active,
+        'date_joined': user.date_joined.isoformat() if user.date_joined else None,
+    }
+
+
 def _player_payload(player):
+    ban_starts_at = getattr(player, 'ban_starts_at', None)
+    ban_expires_at = getattr(player, 'ban_expires_at', None)
+    now = timezone.now()
+    is_banned = bool(ban_expires_at and ban_expires_at > now and (ban_starts_at is None or ban_starts_at <= now))
     return {
         'id': player.player_api_id,
         'name': player.name,
@@ -92,7 +109,53 @@ def _player_payload(player):
         'nationality': player.nationality,
         'date_of_birth': player.date_of_birth.isoformat() if player.date_of_birth else None,
         'value': float(player.cost),
+        'is_banned': is_banned,
+        'ban_starts_at': ban_starts_at.isoformat() if ban_starts_at else None,
+        'ban_expires_at': ban_expires_at.isoformat() if ban_expires_at else None,
+        'ban_reason': getattr(player, 'ban_reason', '') or '',
     }
+
+
+def _parse_optional_datetime(value):
+    if not value:
+        return None
+    parsed = parse_datetime(str(value))
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _apply_player_ban_fields(player, data):
+    if data.get('clear_ban'):
+        player.ban_starts_at = None
+        player.ban_expires_at = None
+        player.ban_reason = ''
+        return
+
+    if 'ban_reason' in data:
+        player.ban_reason = data.get('ban_reason') or ''
+
+    if 'ban_starts_at' in data:
+        player.ban_starts_at = _parse_optional_datetime(data.get('ban_starts_at'))
+
+    if 'ban_expires_at' in data:
+        expires_at = _parse_optional_datetime(data.get('ban_expires_at'))
+        if data.get('ban_expires_at') and expires_at is None:
+            raise ValueError('Invalid ban expiry date.')
+        player.ban_expires_at = expires_at
+
+    if 'ban_duration_weeks' in data and data.get('ban_duration_weeks') not in (None, ''):
+        weeks = int(data.get('ban_duration_weeks'))
+        if weeks < 1:
+            raise ValueError('Ban duration must be at least one week.')
+        start_at = player.ban_starts_at or timezone.now()
+        player.ban_starts_at = start_at
+        player.ban_expires_at = start_at + timedelta(weeks=weeks)
+
+    if player.ban_starts_at and player.ban_expires_at and player.ban_expires_at <= player.ban_starts_at:
+        raise ValueError('Ban expiry must be after the ban start time.')
 
 
 def _clean_players(players):
@@ -129,9 +192,21 @@ def _normalize_player_from_db(player_obj, existing=None):
     }
 
 
+def _is_player_banned(player_obj):
+    if not player_obj:
+        return False
+    return bool(_player_payload(player_obj).get('is_banned'))
+
+
 def _lineup_for_points(team):
     selected = _clean_players(getattr(team, 'selected_players', None))
-    return selected or _clean_players(team.players)
+    players = selected or _clean_players(team.players)
+    available_players = []
+    for player in players:
+        player_obj = Player.objects.filter(player_api_id=player.get('id')).first()
+        if not _is_player_banned(player_obj):
+            available_players.append(player)
+    return available_players
 
 
 def _coerce_datetime(value):
@@ -376,6 +451,8 @@ def _validate_selected_players(players, owned_players):
 
         player_obj = Player.objects.filter(player_api_id=player_id).first()
         if player_obj:
+            if _is_player_banned(player_obj):
+                return None, f'{player_obj.name} is currently banned and unavailable for selection.'
             existing_player = next((owned for owned in owned_players if str(owned.get('id')) == str(player_id)), None)
             selected_players.append(_normalize_player_from_db(player_obj, existing_player))
         else:
@@ -389,7 +466,7 @@ def _validate_selected_players(players, owned_players):
 
 
 def update_rankings_and_rewards(matchweek=None):
-    all_teams = list(UserTeam.objects.all().order_by('-points'))
+    all_teams = list(UserTeam.objects.select_related('user').filter(user__is_staff=False).order_by('-points'))
     for i, team in enumerate(all_teams):
         new_rank = str(i + 1)
         if team.rank != new_rank:
@@ -1412,7 +1489,7 @@ class RequestSignupCodeView(APIView):
             return Response({'detail': 'A user with this email already exists.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if (
-            settings.EMAIL_BACKEND == 'django.core.mail.backends.smtp.EmailBackend'
+            settings.EMAIL_BACKEND == getattr(settings, 'SMTP_EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
             and (not settings.EMAIL_HOST_USER or not settings.EMAIL_HOST_PASSWORD)
         ):
             logger.error('Signup verification email is not configured.')
@@ -1439,8 +1516,6 @@ class RequestSignupCodeView(APIView):
             )
         except Exception:
             logger.exception('Signup verification email failed for %s', email)
-            if settings.DEBUG:
-                print(f"\n[SIGNUP CODE FOR {email}]: {code}\n")
             return Response(
                 {'detail': 'Unable to send verification code. Please try again later.'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1448,21 +1523,23 @@ class RequestSignupCodeView(APIView):
         else:
             print(f"### EMAIL SENT SUCCESSFULLY to {email}")
 
-        return Response({
+        response_data = {
             'detail': 'Verification code sent.',
             'signup_token': signup_token
-        })
+        }
+
+        return Response(response_data)
 
 
 class RegisterView(APIView):
     permission_classes = (AllowAny,)
 
     def post(self, request):
-        email = request.data.get('email')
+        email = (request.data.get('email') or '').strip().lower()
         username = request.data.get('username')
         password = request.data.get('password')
-        code = request.data.get('code')
-        signup_token = request.data.get('signup_token')
+        code = (request.data.get('code') or '').strip()
+        signup_token = (request.data.get('signup_token') or '').strip()
 
         if not all([email, username, password, code, signup_token]):
             return Response({'detail': 'All fields and verification code are required.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1470,7 +1547,9 @@ class RegisterView(APIView):
         # Verify token
         try:
             data = signing.loads(signup_token, max_age=600) # 10 minute expiry
-            if data['email'].lower() != email.lower() or data['code'] != code:
+            token_email = (data.get('email') or '').strip().lower()
+            token_code = str(data.get('code') or '').strip()
+            if token_email != email or not constant_time_compare(token_code, code):
                 return Response({'detail': 'Invalid verification code or email mismatch.'}, status=status.HTTP_400_BAD_REQUEST)
         except signing.SignatureExpired:
             return Response({'detail': 'Verification code has expired.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1481,6 +1560,9 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data={'email': email, 'username': username, 'password': password})
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        if not user.is_active:
+            user.is_active = True
+            user.save(update_fields=['is_active'])
         
         refresh = RefreshToken.for_user(user)
         return Response(
@@ -1523,18 +1605,7 @@ class AdminUsersView(APIView):
 
     def get(self, request):
         users = User.objects.all().order_by('email')
-        return Response(
-            [
-                {
-                    'id': str(user.pk),
-                    'email': user.email,
-                    'username': user.username,
-                    'is_staff': user.is_staff,
-                    'is_active': user.is_active,
-                }
-                for user in users
-            ]
-        )
+        return Response([_admin_user_payload(user) for user in users])
 
 
 class AdminUserDetailView(APIView):
@@ -1552,17 +1623,15 @@ class AdminUserDetailView(APIView):
         if 'role' in request.data:
             user.is_staff = request.data.get('role') == 'admin'
 
+        if str(request.user.pk) == str(user.pk) and not user.is_staff:
+            return Response(
+                {'detail': 'You cannot remove your own admin access.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         user.save()
 
-        return Response(
-            {
-                'id': str(user.pk),
-                'email': user.email,
-                'username': user.username,
-                'is_staff': user.is_staff,
-                'is_active': user.is_active,
-            }
-        )
+        return Response(_admin_user_payload(user))
 
     def delete(self, request, user_id):
         if str(request.user.pk) == str(user_id):
@@ -1605,6 +1674,11 @@ class AdminPlayersView(APIView):
                 'cost': Decimal(str(request.data.get('cost') or request.data.get('value') or '5000000.00')),
             },
         )
+        try:
+            _apply_player_ban_fields(player, request.data)
+        except (TypeError, ValueError) as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        player.save()
         return Response(_player_payload(player), status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
@@ -1616,27 +1690,37 @@ class AdminPlayerDetailView(APIView):
         if not player:
             return Response({'detail': 'Player not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        field_map = {
-            'name': 'name',
-            'position': 'position',
-            'team': 'team_name',
-            'team_name': 'team_name',
-            'team_api_id': 'team_api_id',
-            'nationality': 'nationality',
-        }
-        for incoming, model_field in field_map.items():
-            if incoming in request.data:
-                setattr(player, model_field, request.data.get(incoming))
-        if 'cost' in request.data or 'value' in request.data:
-            player.cost = Decimal(str(request.data.get('cost') or request.data.get('value')))
+        disabled_fields = {'name', 'position', 'team', 'team_name', 'team_api_id', 'nationality', 'cost', 'value'}
+        if disabled_fields.intersection(request.data.keys()):
+            return Response(
+                {'detail': 'Editing player details is disabled. Only ban settings can be updated.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            _apply_player_ban_fields(player, request.data)
+        except (TypeError, ValueError) as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         player.save()
         return Response(_player_payload(player))
 
     def delete(self, request, player_id):
-        deleted, _ = Player.objects.filter(player_api_id=player_id).delete()
-        if not deleted:
-            return Response({'detail': 'Player not found.'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            {'detail': 'Deleting players is disabled.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+
+class PlayerSearchView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        query = (request.query_params.get('q') or '').strip()
+        if len(query) < 2:
+            return Response([])
+
+        players = Player.objects.filter(name__icontains=query).order_by('name')[:10]
+        return Response([player.name for player in players])
 
 
 class AdminMatchesView(APIView):
@@ -2047,6 +2131,9 @@ class UserTransferMarketView(APIView):
         players = Player.objects.all()
         market = []
         for p in players:
+            payload = _player_payload(p)
+            if payload.get('is_banned'):
+                continue
             market.append({
                 'id': p.player_api_id,
                 'name': p.name,
@@ -2054,6 +2141,7 @@ class UserTransferMarketView(APIView):
                 'team': p.team_name,
                 'value': float(p.cost),
                 'is_owned': str(p.player_api_id) in owned_ids,
+                'is_banned': False,
             })
         return Response(market)
 
@@ -2138,6 +2226,8 @@ class UserTransferSubmitView(APIView):
 
             current_budget -= buy_cost
             player_obj = Player.objects.filter(player_api_id=player_in_id).first()
+            if player_obj and _player_payload(player_obj).get('is_banned'):
+                return Response({'detail': f'"{player_obj.name}" is currently banned and unavailable.'}, status=status.HTTP_400_BAD_REQUEST)
             new_player = {
                 'id': player_in_id,
                 'name': player_obj.name if player_obj else in_name,
@@ -2173,6 +2263,8 @@ class UserTransferSubmitView(APIView):
 
             current_budget += net
             player_obj = Player.objects.filter(player_api_id=player_in_id).first()
+            if player_obj and _player_payload(player_obj).get('is_banned'):
+                return Response({'detail': f'"{player_obj.name}" is currently banned and unavailable.'}, status=status.HTTP_400_BAD_REQUEST)
             new_player = {
                 'id': player_in_id,
                 'name': player_obj.name if player_obj else in_name,
@@ -2512,7 +2604,7 @@ class LeaderboardView(APIView):
     def get(self, request):
         try:
             finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
-            teams = list(UserTeam.objects.select_related('user').all())
+            teams = list(UserTeam.objects.select_related('user').filter(user__is_staff=False))
             for team in teams:
                 _reconcile_team_points(team, finished_matches=finished_matches)
             update_rankings_and_rewards()
@@ -2543,7 +2635,7 @@ class WeeklyLeaderboardView(APIView):
     def get(self, request):
         try:
             finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
-            teams = list(UserTeam.objects.select_related('user').all())
+            teams = list(UserTeam.objects.select_related('user').filter(user__is_staff=False))
             for team in teams:
                 _reconcile_team_points(team, finished_matches=finished_matches)
             matchweek = request.query_params.get('matchweek')

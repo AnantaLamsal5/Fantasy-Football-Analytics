@@ -23,8 +23,3 @@ export function saveAdminPlayer(payload) {
 export function updateAdminPlayer(playerId, payload) {
   return apiPatch(`/api/admin/players/${playerId}/`, payload);
 }
-
-export function getAdminMatches(status) {
-  const query = status ? `?status=${encodeURIComponent(status)}` : "";
-  return apiGet(`/api/admin/matches/${query}`);
-}

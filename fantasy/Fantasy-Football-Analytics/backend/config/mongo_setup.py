@@ -81,10 +81,6 @@ def bootstrap_mongo() -> None:
                 'TransferRecords': [
                     ([('user_id', ASCENDING)], {'name': 'transferrecords_user_id_idx'}),
                 ],
-                'AdminMatches': [
-                    ([('kickoff', ASCENDING)], {'name': 'adminmatches_kickoff_idx'}),
-                    ([('matchday', ASCENDING)], {'name': 'adminmatches_matchday_idx'}),
-                ],
                 'Admin': [
                     ([('email', ASCENDING)], {'name': 'admin_email_idx', 'unique': True}),
                 ],
