@@ -429,33 +429,6 @@ export default function MatchesPage() {
                             </div>
                             <BarChart3 className="h-6 w-6 text-primary" />
                           </div>
-                                {hasStats ? (
-                                  <div className="rounded-lg border border-border p-4 bg-muted/10">
-                                    <h4 className="mb-3 text-sm font-black text-muted-foreground">Team stats</h4>
-                                    <div className="grid grid-cols-[auto_1fr_auto] items-center gap-3 text-sm">
-                                      <div className="flex flex-col items-end space-y-2">
-                                        {summaryStats.map(([key, label, suffix]) => (
-                                          <span key={`home-${key}`} className="h-6 w-6 flex items-center justify-center rounded-full bg-primary text-primary-foreground text-xs font-black">
-                                            {formatStat(stats.home?.[key], suffix || "")}
-                                          </span>
-                                        ))}
-                                      </div>
-                                      <div className="flex flex-col space-y-2 text-center text-xs text-muted-foreground">
-                                        {summaryStats.map(([key, label]) => (
-                                          <span key={`label-${key}`}>{label}</span>
-                                        ))}
-                                      </div>
-                                      <div className="flex flex-col items-start space-y-2">
-                                        {summaryStats.map(([key, label, suffix]) => (
-                                          <span key={`away-${key}`} className="h-6 w-6 flex items-center justify-center rounded-full bg-muted text-xs font-black">
-                                            {formatStat(stats.away?.[key], suffix || "")}
-                                          </span>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  </div>
-                                ) : null}
-
                                 {isDetailLoading ? (
                             <div className="rounded-lg border border-border bg-muted/10 p-4">
                               <div className="mb-5 grid grid-cols-[1fr_auto_1fr] items-center gap-3">

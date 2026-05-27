@@ -26,3 +26,11 @@ export function addToWatchlist(player) {
 export function removeFromWatchlist(playerId) {
   return apiDelete("/api/user/watchlist/", { id: playerId });
 }
+
+export function getWatchlistPlayerRecentMatches(playerId) {
+  return apiGet(`/api/user/watchlist/${playerId}/recent-matches/`);
+}
+
+export function getWatchlistPlayerDetails(playerId) {
+  return apiGet(`/api/watchlist/${playerId}/details/`);
+}

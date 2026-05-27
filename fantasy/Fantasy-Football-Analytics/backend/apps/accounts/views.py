@@ -33,11 +33,15 @@ from google.auth.transport import requests as google_requests
 
 from .football_data import (
     canonical_team_name,
+    fetch_api_football_fixture_player_stats_for_match,
     fetch_api_football_fixture_stats_for_match,
+    fetch_api_football_player_stats,
     fetch_match,
     fetch_pl_matches,
     fetch_pl_result_stats,
     fetch_pl_scorers,
+    fetch_pl_teams,
+    fetch_team_players,
     fetch_thesportsdb_event_stats,
 )
 from .email_templates import fantasy_notification_email
@@ -49,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 BASE_BUDGET = Decimal('50000000.00')
 MAX_OWNED_PLAYERS = 15
+MAX_WATCHLIST_PLAYERS = 2
 
 REWARD_BY_RANK = {
     1: Decimal('15000000.00'),
@@ -105,7 +110,7 @@ def _player_payload(player):
     return {
         'id': player.player_api_id,
         'name': player.name,
-        'position': player.position,
+        'position': _normalize_position_label(player.position),
         'team': player.team_name,
         'team_api_id': player.team_api_id,
         'nationality': player.nationality,
@@ -127,6 +132,31 @@ def _parse_optional_datetime(value):
     if timezone.is_naive(parsed):
         parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
     return parsed
+
+
+def _first_non_empty(*values):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text not in {'-', '--', 'N/A', 'n/a', 'Unknown', 'unknown'}:
+            return value
+    return None
+
+
+def _normalize_position_label(position):
+    value = str(position or '').lower()
+    if not value or value in {'unknown', 'n/a', '-', '--'}:
+        return ''
+    if any(token in value for token in ('goalkeeper', 'keeper', 'goalie')):
+        return 'Goalkeeper'
+    if any(token in value for token in ('defence', 'defender', 'centre-back', 'center-back', 'full-back', 'wing-back', 'back')):
+        return 'Defence'
+    if any(token in value for token in ('midfield', 'midfielder', 'central midfield', 'attacking midfield', 'defensive midfield')):
+        return 'Midfield'
+    if any(token in value for token in ('offence', 'offense', 'forward', 'striker', 'winger', 'centre-forward', 'center-forward', 'attack')):
+        return 'Offence'
+    return str(position or '').strip()
 
 
 def _apply_player_ban_fields(player, data):
@@ -186,7 +216,7 @@ def _normalize_player_from_db(player_obj, existing=None):
     return {
         'id': player_obj.player_api_id,
         'name': player_obj.name,
-        'position': player_obj.position,
+        'position': _normalize_position_label(player_obj.position),
         'team': player_obj.team_name,
         'team_api_id': player_obj.team_api_id,
         'value': float(player_obj.cost),
@@ -612,6 +642,26 @@ def _safe_number(value):
 def _safe_int(value):
     number = _safe_number(value)
     return int(number) if number is not None else None
+
+
+def _nested_value(item, *path):
+    current = item
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _first_safe_number(item, *paths):
+    if not isinstance(item, dict):
+        return None
+    for path in paths:
+        raw_value = _nested_value(item, *path) if isinstance(path, tuple) else item.get(path)
+        number = _safe_number(raw_value)
+        if number is not None:
+            return number
+    return None
 
 
 def _normalize_stat_name(name):
@@ -1252,81 +1302,511 @@ def _score_for_team(match, team_api_id):
     return None
 
 
+def _team_names_match(left, right):
+    left_name = canonical_team_name(left)
+    right_name = canonical_team_name(right)
+    if not left_name or not right_name:
+        return False
+    return left_name == right_name or left_name in right_name or right_name in left_name
+
+
+def _player_team_side(player, match):
+    home = match.get('homeTeam') or {}
+    away = match.get('awayTeam') or {}
+    team_api_id = getattr(player, 'team_api_id', None)
+
+    if team_api_id is not None:
+        if str(team_api_id) == str(home.get('id')):
+            return 'home'
+        if str(team_api_id) == str(away.get('id')):
+            return 'away'
+
+    team_name = getattr(player, 'team_name', '') or ''
+    home_name = home.get('name') or home.get('shortName')
+    away_name = away.get('name') or away.get('shortName')
+    if _team_names_match(team_name, home_name):
+        return 'home'
+    if _team_names_match(team_name, away_name):
+        return 'away'
+    return None
+
+
+def _score_for_side(match, side):
+    score = (match.get('score') or {}).get('fullTime') or {}
+    if side == 'home':
+        return score.get('home')
+    if side == 'away':
+        return score.get('away')
+    return None
+
+
+def _opponent_for_side(match, side):
+    home = match.get('homeTeam') or {}
+    away = match.get('awayTeam') or {}
+    opponent = away if side == 'home' else home
+    return opponent.get('shortName') or opponent.get('name')
+
+
+def _result_for_side(match, side):
+    team_goals = _safe_number(_score_for_side(match, side))
+    opponent_goals = _safe_number(_score_for_side(match, 'away' if side == 'home' else 'home'))
+    if team_goals is None or opponent_goals is None:
+        return {'result': None, 'fantasy_points': None}
+    team_display = int(team_goals) if team_goals.is_integer() else team_goals
+    opponent_display = int(opponent_goals) if opponent_goals.is_integer() else opponent_goals
+    if team_goals == opponent_goals:
+        return {'result': f'D {team_display}-{opponent_display}', 'fantasy_points': 1}
+    won = team_goals > opponent_goals
+    return {
+        'result': f"{'W' if won else 'L'} {team_display}-{opponent_display}",
+        'fantasy_points': 3 if won else 0,
+    }
+
+
+def _player_name_matches(left, right):
+    def normalize(value):
+        return re.sub(r'[^a-z0-9]+', ' ', str(value or '').lower()).strip()
+
+    left_name = normalize(left)
+    right_name = normalize(right)
+    if not left_name or not right_name:
+        return False
+    return left_name == right_name or left_name in right_name or right_name in left_name
+
+
+def _player_goal_contributions(player, match):
+    goals = match.get('goals')
+    if not isinstance(goals, list):
+        return None, None
+
+    goal_count = 0
+    assist_count = 0
+    for goal in goals:
+        if not isinstance(goal, dict):
+            continue
+        scorer = (goal.get('scorer') or {}).get('name') or goal.get('player')
+        assist = (goal.get('assist') or {}).get('name') or goal.get('assistName')
+        if _player_name_matches(player.name, scorer):
+            goal_count += 1
+        if _player_name_matches(player.name, assist):
+            assist_count += 1
+    return goal_count, assist_count
+
+
+def _api_football_response_rows(data):
+    if not isinstance(data, dict):
+        return []
+    rows = data.get('response') or []
+    if isinstance(rows, dict):
+        return [rows]
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _best_api_football_player_stat(player, data):
+    rows = _api_football_response_rows(data)
+    player_name = getattr(player, 'name', '') or ''
+    team_name = getattr(player, 'team_name', '') or ''
+    best_stat = None
+
+    for row in rows:
+        api_player = row.get('player') or {}
+        if player_name and not _player_name_matches(player_name, api_player.get('name')):
+            continue
+
+        for stat in row.get('statistics') or []:
+            if not isinstance(stat, dict):
+                continue
+            stat = {
+                **stat,
+                'player': api_player,
+                'seasonStats': row.get('seasonStats') or row.get('stats') or {},
+            }
+            stat_team = stat.get('team') or {}
+            if team_name and _team_names_match(team_name, stat_team.get('name')):
+                return stat
+            if best_stat is None:
+                best_stat = stat
+
+    return best_stat
+
+
+def _season_from_finished_matches(finished_matches):
+    for match in sorted(finished_matches or [], key=_match_sort_kickoff, reverse=True):
+        start_date = (match.get('season') or {}).get('startDate')
+        if start_date:
+            try:
+                return int(str(start_date)[:4])
+            except (TypeError, ValueError):
+                pass
+        kickoff = match.get('utcDate') or match.get('kickoff')
+        if kickoff:
+            try:
+                year = int(str(kickoff)[:4])
+                month = int(str(kickoff)[5:7])
+                return year if month >= 7 else year - 1
+            except (TypeError, ValueError):
+                continue
+    now = timezone.now()
+    return now.year if now.month >= 7 else now.year - 1
+
+
+def _player_season_stats(player, finished_matches=None):
+    if not player:
+        return {'goals': None, 'assists': None, 'matches_played': None, 'minutes': None, 'rating': None}
+
+    season = _season_from_finished_matches(finished_matches or [])
+    try:
+        data = fetch_api_football_player_stats(player_name=player.name, season=season)
+    except Exception as exc:
+        logger.warning("Unable to fetch API-FOOTBALL player stats for %s: %s", player.name, exc)
+        data = {}
+
+    stat = _best_api_football_player_stat(player, data)
+    if not stat and season:
+        try:
+            data = fetch_api_football_player_stats(player_name=player.name)
+            stat = _best_api_football_player_stat(player, data)
+        except Exception as exc:
+            logger.warning("Unable to fetch current API-FOOTBALL player stats for %s: %s", player.name, exc)
+
+    return {
+        'goals': _first_safe_number(stat or {}, ('goals', 'total'), 'goals', ('player', 'goals'), ('seasonStats', 'goals')),
+        'assists': _first_safe_number(stat or {}, ('goals', 'assists'), 'assists'),
+        'matches_played': _first_safe_number(stat or {}, ('games', 'appearences'), ('games', 'appearances'), ('games', 'played'), 'matches_played'),
+        'minutes': _first_safe_number(stat or {}, ('games', 'minutes'), 'minutes'),
+        'rating': _first_safe_number(stat or {}, ('games', 'rating'), 'rating'),
+    }
+
+
+def _fixture_player_rows(api_data):
+    rows = []
+    for team_row in _api_football_response_rows(api_data):
+        for player_row in team_row.get('players') or []:
+            if not isinstance(player_row, dict):
+                continue
+            rows.append(player_row)
+    return rows
+
+
+def _find_fixture_player_row(player, api_data):
+    for row in _fixture_player_rows(api_data):
+        api_player = row.get('player') or {}
+        if str(api_player.get('id')) == str(getattr(player, 'player_api_id', '')):
+            return row
+        if _player_name_matches(getattr(player, 'name', ''), api_player.get('name')):
+            return row
+    return None
+
+
 def _player_performance_from_match(player, match):
-    team_api_id = player.team_api_id
-    is_players_match = team_api_id in (
-        (match.get('homeTeam') or {}).get('id'),
-        (match.get('awayTeam') or {}).get('id'),
-    )
-    if not is_players_match:
+    side = _player_team_side(player, match)
+    if not side:
         return None
 
     player_stats = None
     for raw_player in match.get('players') or match.get('playerStats') or []:
         if not isinstance(raw_player, dict):
             continue
-        raw_id = raw_player.get('id') or raw_player.get('player_id') or raw_player.get('playerId')
-        raw_name = raw_player.get('name') or raw_player.get('player') or raw_player.get('player_name')
-        if str(raw_id) == str(player.player_api_id) or str(raw_name).lower() == player.name.lower():
+        raw_player_data = raw_player.get('player') if isinstance(raw_player.get('player'), dict) else {}
+        raw_id = (
+            raw_player.get('id')
+            or raw_player.get('player_id')
+            or raw_player.get('playerId')
+            or raw_player_data.get('id')
+        )
+        raw_name = (
+            raw_player.get('name')
+            or raw_player.get('player_name')
+            or raw_player_data.get('name')
+            or raw_player.get('player')
+        )
+        if str(raw_id) == str(player.player_api_id) or _player_name_matches(player.name, raw_name):
             player_stats = raw_player
             break
 
     stats_source = player_stats or {}
-    goals = _safe_number(stats_source.get('goals'))
-    if goals is None and player_stats:
-        goals = _safe_number(stats_source.get('numberOfGoals'))
+    if isinstance(stats_source.get('statistics'), list) and stats_source.get('statistics'):
+        stats_source = stats_source['statistics'][0]
+
+    event_goals, event_assists = _player_goal_contributions(player, match)
+    goals = _first_safe_number(stats_source, ('goals', 'total'), 'goals', 'numberOfGoals')
+    assists = _first_safe_number(stats_source, ('goals', 'assists'), 'assists')
+    if goals is None:
+        goals = event_goals
+    if assists is None:
+        assists = event_assists
+
+    kickoff = match.get('utcDate') or match.get('kickoff')
+    result = _result_for_side(match, side)
 
     # football-data.org usually does not expose per-player box scores on the free match endpoint.
     return {
         'match_id': match.get('id'),
         'matchweek': match.get('matchday'),
-        'kickoff': match.get('utcDate'),
-        'opponent': (
-            (match.get('awayTeam') or {}).get('shortName') or (match.get('awayTeam') or {}).get('name')
-            if team_api_id == (match.get('homeTeam') or {}).get('id')
-            else (match.get('homeTeam') or {}).get('shortName') or (match.get('homeTeam') or {}).get('name')
-        ),
-        'team_goals': _score_for_team(match, team_api_id),
+        'kickoff': kickoff,
+        'date': str(kickoff)[:10] if kickoff else None,
+        'opponent': _opponent_for_side(match, side),
+        'result': result['result'],
+        'team_goals': _score_for_side(match, side),
         'goals': goals,
-        'assists': _safe_number(stats_source.get('assists')),
-        'passes_completed': _safe_number(stats_source.get('passes_completed') or stats_source.get('passesCompleted')),
-        'tackles': _safe_number(stats_source.get('tackles')),
-        'saves': _safe_number(stats_source.get('saves')),
-        'minutes': _safe_number(stats_source.get('minutes') or stats_source.get('minutesPlayed')),
-        'rating': _safe_number(stats_source.get('rating') or stats_source.get('score') or stats_source.get('performance_score')),
-        'data_available': bool(player_stats),
+        'assists': assists,
+        'passes_completed': _first_safe_number(stats_source, ('passes', 'total'), 'passes_completed', 'passesCompleted'),
+        'tackles': _first_safe_number(stats_source, ('tackles', 'total'), 'tackles'),
+        'saves': _first_safe_number(stats_source, ('goals', 'saves'), 'saves'),
+        'minutes': _first_safe_number(stats_source, ('games', 'minutes'), 'minutes', 'minutesPlayed'),
+        'rating': _first_safe_number(stats_source, ('games', 'rating'), 'rating', 'score', 'performance_score'),
+        'fantasy_points': result['fantasy_points'],
+        'data_available': bool(player_stats) or event_goals is not None,
     }
 
 
-def _recent_player_performance(player, finished_matches):
+def _recent_player_performance(player, finished_matches, limit=3):
     player_matches = []
     for match in sorted(finished_matches, key=_match_sort_kickoff, reverse=True):
-        item = _player_performance_from_match(player, match)
+        if not _player_team_side(player, match):
+            continue
+
+        detail = match
+        if match.get('id') and match.get('source') != 'football-data.co.uk':
+            try:
+                fetched_detail = fetch_match(match.get('id'))
+                if isinstance(fetched_detail, dict) and fetched_detail:
+                    detail = {**match, **fetched_detail}
+            except Exception as exc:
+                logger.warning("Unable to enrich watchlist match %s: %s", match.get('id'), exc)
+
+            try:
+                fixture_player_stats = fetch_api_football_fixture_player_stats_for_match(detail)
+                fixture_player_row = _find_fixture_player_row(player, fixture_player_stats)
+                if fixture_player_row:
+                    detail = {
+                        **detail,
+                        'playerStats': [fixture_player_row],
+                    }
+            except Exception as exc:
+                logger.warning("Unable to fetch API-FOOTBALL player performance for match %s: %s", match.get('id'), exc)
+
+        item = _player_performance_from_match(player, detail)
         if item:
             player_matches.append(item)
-        if len(player_matches) == 5:
+        if len(player_matches) == limit:
             break
     return player_matches
 
 
+def _clean_watchlist_items(items, limit=MAX_WATCHLIST_PLAYERS):
+    rows = []
+    seen_ids = set()
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        player_id = item.get('id')
+        if player_id is None:
+            continue
+        key = str(player_id)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        rows.append(item)
+        if limit and len(rows) >= limit:
+            break
+    return rows
+
+
+def _coerce_player_api_id(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _player_by_api_id(value):
+    player_id = _coerce_player_api_id(value)
+    if player_id is None:
+        return None
+    return Player.objects.filter(player_api_id=player_id).first()
+
+
+def _player_by_watchlist_item(item):
+    player = _player_by_api_id(item.get('id'))
+    if player:
+        return player
+
+    name = (item.get('name') or item.get('player_name') or '').strip()
+    if not name:
+        return None
+
+    player = Player.objects.filter(name__iexact=name).first()
+    if player:
+        return player
+
+    return Player.objects.filter(name__icontains=name).order_by('name').first()
+
+
+def _api_player_details_for_item(item):
+    player_id = _coerce_player_api_id(item.get('id'))
+    player_name = (item.get('name') or item.get('player_name') or '').strip()
+    if player_id is None and not player_name:
+        return {}
+
+    try:
+        teams = fetch_pl_teams()
+    except Exception as exc:
+        logger.warning("Unable to fetch teams for watchlist enrichment: %s", exc)
+        return {}
+
+    for team in teams:
+        team_id = team.get('id')
+        if not team_id:
+            continue
+        try:
+            squad = fetch_team_players(team_id)
+        except Exception as exc:
+            logger.warning("Unable to fetch squad %s for watchlist enrichment: %s", team_id, exc)
+            continue
+
+        matched = None
+        for squad_player in squad:
+            if not isinstance(squad_player, dict):
+                continue
+            if player_id is not None and str(squad_player.get('id')) == str(player_id):
+                matched = squad_player
+                break
+            if player_name and _player_name_matches(player_name, squad_player.get('name')):
+                matched = squad_player
+                break
+
+        if matched:
+            return {
+                'id': matched.get('id') or item.get('id'),
+                'name': matched.get('name') or item.get('name'),
+                'position': _normalize_position_label(matched.get('position')),
+                'team': team.get('name') or item.get('team') or item.get('club'),
+                'team_api_id': team_id,
+                'nationality': matched.get('nationality') or item.get('nationality'),
+                'date_of_birth': matched.get('dateOfBirth') or item.get('date_of_birth'),
+            }
+
+    return {}
+
+
+def _watchlist_base_payload(item, player=None):
+    api_details = {}
+    item_has_position = bool(_first_non_empty(item.get('position')))
+    item_has_team = bool(_first_non_empty(item.get('team'), item.get('team_name'), item.get('club')))
+    item_has_name = bool(_first_non_empty(item.get('name'), item.get('player_name')))
+    needs_enrichment = not (item_has_position and item_has_team and item_has_name)
+
+    if player and (not _first_non_empty(player.position) or not _first_non_empty(player.team_name)):
+        needs_enrichment = True
+    if not player:
+        needs_enrichment = True
+
+    if needs_enrichment:
+        api_details = _api_player_details_for_item(item)
+
+    if player and api_details:
+        update_fields = []
+        api_position = _normalize_position_label(api_details.get('position'))
+        api_team = api_details.get('team')
+        api_team_id = api_details.get('team_api_id')
+        if api_position and not _first_non_empty(player.position):
+            player.position = api_position
+            update_fields.append('position')
+        if api_team and not _first_non_empty(player.team_name):
+            player.team_name = api_team
+            update_fields.append('team_name')
+        if api_team_id and not player.team_api_id:
+            player.team_api_id = api_team_id
+            update_fields.append('team_api_id')
+        if update_fields:
+            player.save(update_fields=update_fields)
+
+    if player:
+        payload = _player_payload(player)
+    else:
+        payload = {
+            'id': _first_non_empty(api_details.get('id'), item.get('id')),
+            'name': _first_non_empty(api_details.get('name'), item.get('name'), item.get('player_name'), 'Unknown player'),
+            'position': _normalize_position_label(_first_non_empty(api_details.get('position'), item.get('position'))),
+            'team': _first_non_empty(api_details.get('team'), item.get('team'), item.get('team_name'), item.get('club'), ''),
+            'team_api_id': _first_non_empty(api_details.get('team_api_id'), item.get('team_api_id')),
+            'nationality': _first_non_empty(api_details.get('nationality'), item.get('nationality'), ''),
+            'date_of_birth': _first_non_empty(api_details.get('date_of_birth'), item.get('date_of_birth')),
+            'value': _first_non_empty(item.get('value'), item.get('cost')),
+        }
+
+    payload['position'] = _normalize_position_label(_first_non_empty(
+        payload.get('position'),
+        api_details.get('position'),
+        item.get('position'),
+    ))
+    payload['team'] = _first_non_empty(
+        payload.get('team'),
+        api_details.get('team'),
+        item.get('team'),
+        item.get('team_name'),
+        item.get('club'),
+        '',
+    )
+    payload['team_api_id'] = _first_non_empty(payload.get('team_api_id'), api_details.get('team_api_id'), item.get('team_api_id'))
+    payload['value'] = _first_non_empty(payload.get('value'), item.get('value'), item.get('cost'))
+    payload['added_at'] = item.get('added_at') or timezone.now().isoformat()
+    return payload
+
+
+def _ensure_watchlist_state(team):
+    cleaned = _clean_watchlist_items(team.watchlist)
+    if cleaned != list(team.watchlist or []):
+        team.watchlist = cleaned
+        team.save(update_fields=['watchlist'])
+    return cleaned
+
+
 def _watchlist_payload(team, finished_matches=None):
-    watchlist = [item for item in list(team.watchlist or []) if isinstance(item, dict)]
-    player_ids = [item.get('id') for item in watchlist if item.get('id') is not None]
-    player_lookup = {
-        str(player.player_api_id): player
-        for player in Player.objects.filter(player_api_id__in=player_ids)
-    }
+    watchlist = _clean_watchlist_items(team.watchlist)
     finished_matches = finished_matches if finished_matches is not None else fetch_pl_matches(limit=500, status='FINISHED')
 
     rows = []
+    persisted = []
     for item in watchlist:
-        player = player_lookup.get(str(item.get('id')))
-        payload = _player_payload(player) if player else dict(item)
+        player = _player_by_watchlist_item(item)
+        payload = _watchlist_base_payload(item, player)
+        season_stats = _player_season_stats(player, finished_matches) if player else {
+            'goals': _first_safe_number(item, 'goals', ('statistics', 'goals', 'total'), ('goals', 'total'), ('playerStats', 'goals'), ('player', 'goals'), ('seasonStats', 'goals')),
+            'assists': _first_safe_number(item, 'assists', ('statistics', 'goals', 'assists'), ('goals', 'assists')),
+            'matches_played': _first_safe_number(item, 'matches_played', ('games', 'appearences'), ('games', 'appearances')),
+            'minutes': _first_safe_number(item, 'minutes', ('games', 'minutes')),
+            'rating': _first_safe_number(item, 'rating', ('games', 'rating')),
+        }
+        payload['season_stats'] = season_stats
+        payload['goals'] = season_stats.get('goals')
+        payload['assists'] = season_stats.get('assists')
+        payload['matches_played'] = season_stats.get('matches_played')
+        persisted.append({
+            key: payload.get(key)
+            for key in (
+                'id',
+                'name',
+                'position',
+                'team',
+                'team_api_id',
+                'nationality',
+                'date_of_birth',
+                'value',
+                'added_at',
+            )
+            if payload.get(key) not in (None, '')
+        })
         payload['recent_performance'] = _recent_player_performance(player, finished_matches) if player else []
         payload['performance_available'] = any(
             entry.get('data_available') for entry in payload['recent_performance']
         )
         rows.append(payload)
+
+    if persisted != list(team.watchlist or [])[:len(persisted)]:
+        team.watchlist = persisted
+        team.save(update_fields=['watchlist'])
     return rows
 
 
@@ -2403,8 +2883,9 @@ class UserTransferMarketView(APIView):
             market.append({
                 'id': p.player_api_id,
                 'name': p.name,
-                'position': p.position,
+                'position': _normalize_position_label(p.position),
                 'team': p.team_name,
+                'team_api_id': p.team_api_id,
                 'value': float(p.cost),
                 'is_owned': str(p.player_api_id) in owned_ids,
                 'is_banned': False,
@@ -2616,6 +3097,7 @@ class WatchlistView(APIView):
 
     def get(self, request):
         team, _ = UserTeam.objects.get_or_create(user=request.user)
+        _ensure_watchlist_state(team)
         finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
         return Response(_watchlist_payload(team, finished_matches))
 
@@ -2625,20 +3107,32 @@ class WatchlistView(APIView):
             return Response({'detail': 'Player id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         team, _ = UserTeam.objects.get_or_create(user=request.user)
-        watchlist = list(team.watchlist or [])
-        player = Player.objects.filter(player_api_id=player_id).first()
-        payload = _player_payload(player) if player else {
+        watchlist = _ensure_watchlist_state(team)
+        if any(str(item.get('id')) == str(player_id) for item in watchlist):
+            return Response(
+                {'detail': 'Player is already in your watchlist.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(watchlist) >= MAX_WATCHLIST_PLAYERS:
+            return Response(
+                {'detail': 'You can only watchlist 2 players at a time.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        player = _player_by_api_id(player_id)
+        request_payload = {
             'id': player_id,
             'name': request.data.get('name', 'Unknown player'),
             'position': request.data.get('position', ''),
             'team': request.data.get('team', ''),
+            'team_api_id': request.data.get('team_api_id'),
             'value': request.data.get('value', 0),
         }
+        payload = _watchlist_base_payload(request_payload, player)
 
-        if not any(str(item.get('id')) == str(player_id) for item in watchlist):
-            watchlist.append(payload)
-            team.watchlist = watchlist
-            team.save(update_fields=['watchlist'])
+        watchlist.append(payload)
+        team.watchlist = watchlist
+        team.save(update_fields=['watchlist'])
         return Response(_watchlist_payload(team))
 
     def delete(self, request):
@@ -2646,9 +3140,55 @@ class WatchlistView(APIView):
         if player_id is None:
             return Response({'detail': 'Player id is required.'}, status=status.HTTP_400_BAD_REQUEST)
         team, _ = UserTeam.objects.get_or_create(user=request.user)
-        team.watchlist = [item for item in (team.watchlist or []) if str(item.get('id')) != str(player_id)]
+        team.watchlist = [item for item in _clean_watchlist_items(team.watchlist) if str(item.get('id')) != str(player_id)]
         team.save(update_fields=['watchlist'])
         return Response(_watchlist_payload(team))
+
+
+class WatchlistRecentMatchesView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, player_id):
+        team, _ = UserTeam.objects.get_or_create(user=request.user)
+        watchlist = _ensure_watchlist_state(team)
+        if not any(str(item.get('id')) == str(player_id) for item in watchlist):
+            return Response({'detail': 'Player is not in your watchlist.'}, status=status.HTTP_404_NOT_FOUND)
+
+        player = _player_by_api_id(player_id)
+        if not player:
+            return Response({'detail': 'Player not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
+        return Response(_recent_player_performance(player, finished_matches, limit=3))
+
+
+class WatchlistPlayerDetailsView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, player_id):
+        team, _ = UserTeam.objects.get_or_create(user=request.user)
+        watchlist = _ensure_watchlist_state(team)
+        item = next((entry for entry in watchlist if str(entry.get('id')) == str(player_id)), None)
+        if not item:
+            return Response({'detail': 'Player is not in your watchlist.'}, status=status.HTTP_404_NOT_FOUND)
+
+        player = _player_by_watchlist_item(item)
+        finished_matches = fetch_pl_matches(limit=500, status='FINISHED')
+        payload = _watchlist_base_payload(item, player)
+        season_stats = _player_season_stats(player, finished_matches) if player else {
+            'goals': _first_safe_number(item, 'goals', ('statistics', 'goals', 'total'), ('goals', 'total'), ('playerStats', 'goals'), ('player', 'goals'), ('seasonStats', 'goals')),
+            'assists': _first_safe_number(item, 'assists', ('statistics', 'goals', 'assists'), ('goals', 'assists')),
+            'matches_played': _first_safe_number(item, 'matches_played', ('games', 'appearences'), ('games', 'appearances')),
+            'minutes': _first_safe_number(item, 'minutes', ('games', 'minutes')),
+            'rating': _first_safe_number(item, 'rating', ('games', 'rating')),
+        }
+        payload['season_stats'] = season_stats
+        payload['goals'] = season_stats.get('goals')
+        payload['assists'] = season_stats.get('assists')
+        payload['matches_played'] = season_stats.get('matches_played')
+        payload['recent_performance'] = _recent_player_performance(player, finished_matches, limit=3) if player else []
+        payload['performance_available'] = any(entry.get('data_available') for entry in payload['recent_performance'])
+        return Response(payload)
 
 
 class NotificationsView(APIView):

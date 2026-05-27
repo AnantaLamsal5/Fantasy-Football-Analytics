@@ -10,6 +10,7 @@ import {
   Users, 
   AlertCircle,
   CheckCircle2,
+  LoaderCircle,
   Star,
   X,
   ArrowUpDown
@@ -19,11 +20,14 @@ import {
   getTransferHistory,
   getTransferMarket,
   getWatchlist,
+  getWatchlistPlayerDetails,
   removeFromWatchlist,
   submitTransfer,
 } from "@/services/transferService";
 import { getMyTeam } from "@/services/teamService";
 import ProtectedRoute from "@/components/ProtectedRoute";
+
+const WATCHLIST_LIMIT = 2;
 
 export default function TransfersPage() {
   const [marketPlayers, setMarketPlayers] = useState([]);
@@ -35,11 +39,71 @@ export default function TransfersPage() {
   const [status, setStatus] = useState({ type: null, message: "" });
   const [pendingTransfer, setPendingTransfer] = useState(null); // { out: player, in: player }
   const [watchlist, setWatchlist] = useState([]);
+  const [watchlistPendingId, setWatchlistPendingId] = useState(null);
+  const [watchlistDetailsLoading, setWatchlistDetailsLoading] = useState(false);
+  const [watchlistDetailsError, setWatchlistDetailsError] = useState("");
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
     loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function persistTransferState(partial) {
+    if (typeof window === "undefined") return;
+    try {
+      const existing = JSON.parse(localStorage.getItem("ff_transfer_state") || "{}");
+      localStorage.setItem(
+        "ff_transfer_state",
+        JSON.stringify({
+          ...existing,
+          market: existing.market || marketPlayers,
+          team: existing.team || myTeam,
+          transferHistory: existing.transferHistory || history,
+          ...partial,
+        })
+      );
+    } catch (storageError) {
+      console.warn("Unable to persist transfer fallback state", storageError);
+    }
+  }
+
+  function applyWatchlist(nextWatchlist) {
+    const normalized = nextWatchlist || [];
+    setWatchlist(normalized);
+    persistTransferState({ watch: normalized });
+  }
+
+  async function loadWatchlistDetails(players) {
+    const rows = (players || []).filter((player) => player?.id !== null && player?.id !== undefined);
+    if (!rows.length) {
+      applyWatchlist([]);
+      setWatchlistDetailsLoading(false);
+      setWatchlistDetailsError("");
+      return [];
+    }
+
+    setWatchlistDetailsLoading(true);
+    setWatchlistDetailsError("");
+    let failedCount = 0;
+    const detailedRows = await Promise.all(
+      rows.map(async (player) => {
+        try {
+          const details = await getWatchlistPlayerDetails(player.id);
+          return { ...player, ...details };
+        } catch {
+          failedCount += 1;
+          return player;
+        }
+      })
+    );
+    applyWatchlist(detailedRows);
+    if (failedCount > 0) {
+      setWatchlistDetailsError("Some watchlist details are temporarily unavailable.");
+    }
+    setWatchlistDetailsLoading(false);
+    return detailedRows;
+  }
 
   async function loadData() {
     setLoading(true);
@@ -62,9 +126,10 @@ export default function TransfersPage() {
       setMyTeam(nextTeam);
       setWatchlist(watch || []);
       setHistory(transferHistory || []);
+      const detailedWatch = await loadWatchlistDetails(watch || []);
       if (typeof window !== "undefined") {
         localStorage.setItem("ff_owned_players", JSON.stringify(nextTeam.players || []));
-        localStorage.setItem("ff_transfer_state", JSON.stringify({ market, team: nextTeam, watch, transferHistory }));
+        localStorage.setItem("ff_transfer_state", JSON.stringify({ market, team: nextTeam, watch: detailedWatch, transferHistory }));
         window.dispatchEvent(new Event("ff_owned_players_updated"));
       }
     } catch (e) {
@@ -89,12 +154,43 @@ export default function TransfersPage() {
   }
 
   async function toggleWatchlist(player) {
+    const playerId = player?.id;
+    if (playerId === null || playerId === undefined) {
+      setStatus({ type: "error", message: "Player id is required." });
+      return;
+    }
+
+    const isWatched = watchlist.some((item) => String(item.id) === String(playerId));
+    if (!isWatched && watchlist.length >= WATCHLIST_LIMIT) {
+      setStatus({ type: "error", message: "You can only watchlist 2 players at a time." });
+      return;
+    }
+
+    const previousWatchlist = watchlist;
+    const optimisticWatchlist = isWatched
+      ? watchlist.filter((item) => String(item.id) !== String(playerId))
+      : [...watchlist, { ...player, recent_performance: player.recent_performance || [] }];
+
+    setWatchlistPendingId(playerId);
+    setStatus({
+      type: "loading",
+      message: isWatched ? "Removing player from watchlist..." : "Adding player to watchlist...",
+    });
+    applyWatchlist(optimisticWatchlist);
+
     try {
-      const isWatched = watchlist.some((item) => String(item.id) === String(player.id));
-      const updated = isWatched ? await removeFromWatchlist(player.id) : await addToWatchlist(player);
-      setWatchlist(updated || []);
+      const updated = isWatched ? await removeFromWatchlist(playerId) : await addToWatchlist(player);
+      const detailedWatchlist = await loadWatchlistDetails(updated || []);
+      applyWatchlist(detailedWatchlist || []);
+      setStatus({
+        type: "success",
+        message: isWatched ? "Player removed from watchlist." : "Player added to watchlist.",
+      });
     } catch (e) {
+      applyWatchlist(previousWatchlist);
       setStatus({ type: "error", message: e.message || "Failed to update watchlist." });
+    } finally {
+      setWatchlistPendingId(null);
     }
   }
 
@@ -102,7 +198,7 @@ export default function TransfersPage() {
     .filter(p => {
       const matchesSearch = (p.name || "").toLowerCase().includes(search.toLowerCase()) ||
                            (p.team || "").toLowerCase().includes(search.toLowerCase());
-      const matchesPos = posFilter === "All" || p.position === posFilter;
+      const matchesPos = posFilter === "All" || normalizePositionLabel(p.position) === posFilter;
       return matchesSearch && matchesPos;
     })
     .sort((a, b) => {
@@ -137,6 +233,7 @@ export default function TransfersPage() {
 
   const formatCurrency = (val) => {
     const num = parseFloat(val);
+    if (Number.isNaN(num)) return "N/A";
     return new Intl.NumberFormat('en-IE', {
       style: 'currency',
       currency: 'EUR',
@@ -146,8 +243,27 @@ export default function TransfersPage() {
   };
 
   const formatMetric = (value, suffix = "") => {
-    if (value === null || value === undefined || value === "") return "-";
+    if (value === null || value === undefined) return "N/A";
+    const text = String(value).trim();
+    if (!text || ["-", "--", "unknown", "n/a"].includes(text.toLowerCase())) return "N/A";
     return `${value}${suffix}`;
+  };
+
+  const normalizePositionLabel = (position) => {
+    const text = formatMetric(position);
+    if (text === "N/A") return text;
+    const value = text.toLowerCase();
+    if (value.includes("goalkeeper") || value.includes("keeper") || value.includes("goalie")) return "Goalkeeper";
+    if (value.includes("defence") || value.includes("defender") || value.includes("back")) return "Defence";
+    if (value.includes("midfield")) return "Midfield";
+    if (value.includes("offence") || value.includes("offense") || value.includes("forward") || value.includes("striker") || value.includes("winger") || value.includes("attack")) return "Offence";
+    return text;
+  };
+
+  const formatMatchDate = (value) => {
+    if (!value) return "N/A";
+    const datePart = String(value).slice(0, 10);
+    return datePart || "N/A";
   };
 
   const performanceTone = (row) => {
@@ -164,6 +280,12 @@ export default function TransfersPage() {
   const ownedPlayerIds = new Set((myTeam.players || []).filter(Boolean).map((p) => String(p.id)));
   const ownedCount = myTeam.owned_count ?? (myTeam.players || []).filter(Boolean).length;
   const maxPlayers = myTeam.max_players || 15;
+  const statusTone =
+    status.type === "success"
+      ? "bg-green-500/10 border-green-500/20 text-green-500"
+      : status.type === "loading"
+        ? "bg-primary/10 border-primary/20 text-primary"
+        : "bg-red-500/10 border-red-500/20 text-red-500";
 
   function getBuyBlockReason(player) {
     if (ownedPlayerIds.has(String(player.id)) || player.is_owned) return "Owned";
@@ -217,11 +339,15 @@ export default function TransfersPage() {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
             exit={{ opacity: 0, height: 0 }}
-            className={`mb-6 p-4 rounded-xl flex items-center gap-3 border ${
-              status.type === "success" ? "bg-green-500/10 border-green-500/20 text-green-500" : "bg-red-500/10 border-red-500/20 text-red-500"
-            }`}
+            className={`mb-6 p-4 rounded-xl flex items-center gap-3 border ${statusTone}`}
           >
-            {status.type === "success" ? <CheckCircle2 className="h-5 w-5" /> : <AlertCircle className="h-5 w-5" />}
+            {status.type === "success" ? (
+              <CheckCircle2 className="h-5 w-5" />
+            ) : status.type === "loading" ? (
+              <LoaderCircle className="h-5 w-5 animate-spin" />
+            ) : (
+              <AlertCircle className="h-5 w-5" />
+            )}
             <span className="font-bold">{status.message}</span>
             <button onClick={() => setStatus({ type: null, message: "" })} className="ml-auto">
               <X className="h-4 w-4" />
@@ -305,10 +431,10 @@ export default function TransfersPage() {
                       <td className="px-4 py-4">
                         <div className="font-bold">{player.name}</div>
                       </td>
-                      <td className="px-4 py-4 text-sm text-muted-foreground">{player.team}</td>
+                      <td className="px-4 py-4 text-sm text-muted-foreground">{formatMetric(player.team || player.team_name || player.club)}</td>
                       <td className="px-4 py-4">
                         <span className="text-[10px] font-black px-2 py-1 rounded bg-muted border border-border">
-                          {player.position.toUpperCase()}
+                          {normalizePositionLabel(player.position).toUpperCase()}
                         </span>
                       </td>
                       <td className="px-4 py-4 font-mono text-sm font-bold">
@@ -317,7 +443,10 @@ export default function TransfersPage() {
                       <td className="px-4 py-4 text-right">
                         <button
                           onClick={() => toggleWatchlist(player)}
-                          className="mr-2 p-2 rounded-lg border border-border hover:bg-muted"
+                          disabled={String(watchlistPendingId) === String(player.id)}
+                          className={`mr-2 p-2 rounded-lg border border-border hover:bg-muted ${
+                            String(watchlistPendingId) === String(player.id) ? "opacity-60 cursor-wait" : ""
+                          }`}
                           aria-label="Toggle watchlist"
                         >
                           <Star
@@ -376,7 +505,7 @@ export default function TransfersPage() {
                     <div>
                       <div className="font-bold text-sm">{p.name}</div>
                       <div className="text-[10px] text-muted-foreground uppercase font-bold tracking-tighter">
-                        {p.position} - {p.team}
+                        {normalizePositionLabel(p.position)} - {formatMetric(p.team || p.team_name || p.club)}
                       </div>
                     </div>
                     <button
@@ -420,7 +549,15 @@ export default function TransfersPage() {
           </div>
 
           <div className="card p-6">
-            <h3 className="font-bold text-sm uppercase tracking-widest text-muted-foreground mb-4">Watchlist</h3>
+            <h3 className="font-bold text-sm uppercase tracking-widest text-muted-foreground mb-4">
+              Watchlist ({watchlist.length}/{WATCHLIST_LIMIT})
+            </h3>
+            {watchlistDetailsLoading ? (
+              <p className="mb-3 text-xs font-bold text-primary">Loading player details...</p>
+            ) : null}
+            {watchlistDetailsError ? (
+              <p className="mb-3 text-xs font-bold text-red-500">{watchlistDetailsError}</p>
+            ) : null}
             <div className="space-y-4">
               {watchlist.map((player) => {
                 const recent = player.recent_performance || [];
@@ -429,20 +566,35 @@ export default function TransfersPage() {
                     <div className="mb-3 flex items-start justify-between gap-3">
                       <div>
                         <p className="text-sm font-black">{player.name}</p>
-                        <p className="text-[11px] text-muted-foreground">{player.position} - {player.team}</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          {normalizePositionLabel(player.position)} - {formatMetric(player.team || player.team_name || player.club)}
+                        </p>
+                        <p className="text-[11px] font-bold text-primary">{formatCurrency(player.value)}</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          G {formatMetric(player.goals ?? player.season_stats?.goals)} / A {formatMetric(player.assists ?? player.season_stats?.assists)} / MP {formatMetric(player.matches_played ?? player.season_stats?.matches_played)}
+                        </p>
                       </div>
-                      <button onClick={() => toggleWatchlist(player)} className="text-xs font-bold text-primary">Remove</button>
+                      <button
+                        onClick={() => toggleWatchlist(player)}
+                        disabled={String(watchlistPendingId) === String(player.id)}
+                        className="text-xs font-bold text-primary disabled:opacity-60 disabled:cursor-wait"
+                      >
+                        Remove
+                      </button>
                     </div>
 
                     {recent.length > 0 ? (
                       <div className="overflow-x-auto">
-                        <table className="w-full min-w-[520px] text-left text-[11px]">
+                        <table className="w-full min-w-[760px] text-left text-[11px]">
                           <thead className="text-muted-foreground">
                             <tr>
-                              <th className="py-2 pr-2">MW</th>
+                              <th className="py-2 pr-2">Date</th>
+                              <th className="py-2 pr-2">Opp</th>
+                              <th className="py-2 pr-2">Result</th>
                               <th className="py-2 pr-2">Min</th>
                               <th className="py-2 pr-2">G</th>
                               <th className="py-2 pr-2">A</th>
+                              <th className="py-2 pr-2">Pts</th>
                               <th className="py-2 pr-2">Pass</th>
                               <th className="py-2 pr-2">Tkl</th>
                               <th className="py-2 pr-2">Sv</th>
@@ -451,11 +603,14 @@ export default function TransfersPage() {
                           </thead>
                           <tbody className="space-y-1">
                             {recent.map((row) => (
-                              <tr key={`${player.id}-${row.match_id}`} className={`border-t ${performanceTone(row)}`}>
-                                <td className="py-2 pr-2 font-bold">{formatMetric(row.matchweek)}</td>
+                              <tr key={`${player.id}-${row.match_id || row.date || row.opponent}`} className={`border-t ${performanceTone(row)}`}>
+                                <td className="py-2 pr-2 font-bold">{formatMatchDate(row.date || row.kickoff)}</td>
+                                <td className="py-2 pr-2">{formatMetric(row.opponent)}</td>
+                                <td className="py-2 pr-2 font-bold">{formatMetric(row.result)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.minutes)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.goals)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.assists)}</td>
+                                <td className="py-2 pr-2 font-bold">{formatMetric(row.fantasy_points)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.passes_completed)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.tackles)}</td>
                                 <td className="py-2 pr-2">{formatMetric(row.saves)}</td>
@@ -478,7 +633,7 @@ export default function TransfersPage() {
                   </div>
                 );
               })}
-              {watchlist.length === 0 ? <p className="text-sm text-muted-foreground">No favorite players yet.</p> : null}
+              {watchlist.length === 0 ? <p className="text-sm text-muted-foreground">No watchlisted players yet.</p> : null}
             </div>
           </div>
 
@@ -521,7 +676,11 @@ export default function TransfersPage() {
                 <div className="flex justify-between items-center mb-4">
                   <span className="text-sm text-muted-foreground">Team</span>
                   <span className="font-bold">
-                    {pendingTransfer.mode === "sell" ? pendingTransfer.out?.team : pendingTransfer.in?.team}
+                    {formatMetric(
+                      pendingTransfer.mode === "sell"
+                        ? pendingTransfer.out?.team || pendingTransfer.out?.team_name || pendingTransfer.out?.club
+                        : pendingTransfer.in?.team || pendingTransfer.in?.team_name || pendingTransfer.in?.club
+                    )}
                   </span>
                 </div>
                 <div className="flex justify-between items-center border-t border-border pt-4">

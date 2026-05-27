@@ -665,6 +665,30 @@ def fetch_api_football_fixture_stats(fixture_id, return_meta=False):
     return (data, meta) if return_meta else data
 
 
+def fetch_api_football_fixture_player_stats(fixture_id, return_meta=False):
+    fixture = str(fixture_id or '').strip()
+    if not fixture:
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_fixture_id'}
+        return ({}, meta) if return_meta else {}
+
+    if not _api_football_key():
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_api_key'}
+        return ({}, meta) if return_meta else {}
+
+    cache_timeout = int(getattr(settings, 'API_FOOTBALL_STATS_CACHE_SECONDS', 6 * 60 * 60))
+    url = _api_football_url('/fixtures/players', {'fixture': fixture})
+    data, meta = _fetch_external_json(
+        url,
+        f"api-football:fixture-player-stats:{fixture}",
+        cache_timeout,
+        'API-FOOTBALL',
+        headers=_api_football_headers(),
+    )
+    response_rows = data.get('response') if isinstance(data, dict) else None
+    meta['response_count'] = len(response_rows) if isinstance(response_rows, list) else 0
+    return (data, meta) if return_meta else data
+
+
 def fetch_api_football_fixture_stats_for_match(match, return_meta=False):
     fixture_id, fixture_meta = resolve_api_football_fixture_id(match, return_meta=True)
     if not fixture_id:
@@ -682,6 +706,54 @@ def fetch_api_football_fixture_stats_for_match(match, return_meta=False):
         'fixture_lookup': fixture_meta,
         'stats_request': stats_meta,
     }
+    return (data, meta) if return_meta else data
+
+
+def fetch_api_football_fixture_player_stats_for_match(match, return_meta=False):
+    fixture_id, fixture_meta = resolve_api_football_fixture_id(match, return_meta=True)
+    if not fixture_id:
+        meta = {
+            'source': 'API-FOOTBALL',
+            'error': 'fixture_not_resolved',
+            'fixture_lookup': fixture_meta,
+        }
+        return ({}, meta) if return_meta else {}
+
+    data, stats_meta = fetch_api_football_fixture_player_stats(fixture_id, return_meta=True)
+    meta = {
+        'source': 'API-FOOTBALL',
+        'fixture_id': fixture_id,
+        'fixture_lookup': fixture_meta,
+        'stats_request': stats_meta,
+    }
+    return (data, meta) if return_meta else data
+
+
+def fetch_api_football_player_stats(player_name=None, season=None, return_meta=False):
+    name = str(player_name or '').strip()
+    if not name:
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_player_name'}
+        return ({}, meta) if return_meta else {}
+
+    if not _api_football_key():
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_api_key'}
+        return ({}, meta) if return_meta else {}
+
+    query = {'league': 39, 'search': name}
+    if season:
+        query['season'] = season
+
+    cache_timeout = int(getattr(settings, 'API_FOOTBALL_STATS_CACHE_SECONDS', 6 * 60 * 60))
+    url = _api_football_url('/players', query)
+    data, meta = _fetch_external_json(
+        url,
+        f"api-football:player-stats:{season or 'current'}:{name.lower()}",
+        cache_timeout,
+        'API-FOOTBALL',
+        headers=_api_football_headers(),
+    )
+    response_rows = data.get('response') if isinstance(data, dict) else None
+    meta['response_count'] = len(response_rows) if isinstance(response_rows, list) else 0
     return (data, meta) if return_meta else data
 
 
