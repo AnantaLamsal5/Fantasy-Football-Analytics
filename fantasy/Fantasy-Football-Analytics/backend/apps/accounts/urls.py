@@ -32,9 +32,14 @@ from .views import (
     ProfilePictureUploadView,
     ChangePasswordView,
     LeaderboardView,
+    LiveScoresView,
+    MatchDifficultyView,
     SyncPointsView,
     SimulateLastMatchweekView,
     TopAttackersView,
+    UserMatchDetailView,
+    UserMatchStatsView,
+    UserMatchesView,
 )
 
 urlpatterns = [
@@ -60,6 +65,11 @@ urlpatterns = [
     path('user/team/', UserTeamView.as_view(), name='user_team'),
     path('user/analytics/top-attackers/', TopAttackersView.as_view(), name='user_top_attackers'),
     path('user/transfers/market/', UserTransferMarketView.as_view(), name='user_transfer_market'),
+    path('user/matches/', UserMatchesView.as_view(), name='user_matches'),
+    path('user/matches/<int:match_id>/', UserMatchDetailView.as_view(), name='user_match_detail'),
+    path('user/matches/<int:match_id>/statistics/', UserMatchStatsView.as_view(), name='user_match_stats'),
+    path('user/matches/live/', LiveScoresView.as_view(), name='user_live_scores'),
+    path('user/matches/difficulty/', MatchDifficultyView.as_view(), name='user_match_difficulty'),
     path('players/search/', PlayerSearchView.as_view(), name='player_search'),
     path('players/', UserTransferMarketView.as_view(), name='players'),
     path('user/transfers/submit/', UserTransferSubmitView.as_view(), name='user_transfer_submit'),

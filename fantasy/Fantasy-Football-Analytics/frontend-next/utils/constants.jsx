@@ -8,6 +8,7 @@ export const APP_ROUTES = {
   dashboard: "/dashboard",
   profile: "/profile",
   leaderboard: "/leaderboard",
+  matches: "/matches",
   predictions: "/predictions",
   team: "/teams",
   transfers: "/transfers",

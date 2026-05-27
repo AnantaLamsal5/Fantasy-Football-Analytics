@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 import logging
 import os
 import random
+import re
 import string
 import threading
 import uuid
@@ -32,6 +33,7 @@ from google.auth.transport import requests as google_requests
 
 from .football_data import (
     canonical_team_name,
+    fetch_api_football_fixture_stats_for_match,
     fetch_match,
     fetch_pl_matches,
     fetch_pl_result_stats,
@@ -623,8 +625,21 @@ STAT_ALIASES = {
     'shots_on_target': {'shotsontarget', 'shotsongoal', 'ontarget', 'shotson'},
     'shots_off_target': {'shotsofftarget', 'shotsoffgoal'},
     'possession': {'possession', 'ballpossession'},
-    'pass_accuracy': {'passaccuracy', 'passesaccuracy', 'accuratepassespercentage'},
-    'passes': {'passes', 'totalpasses'},
+    'pass_accuracy': {
+        'passaccuracy',
+        'passesaccuracy',
+        'accuratepassespercentage',
+        'passingaccuracy',
+        'passcompletion',
+        'passcompletionrate',
+        'passsuccess',
+        'passsuccessrate',
+        'passespercentage',
+        'passespercent',
+        'passpercentage',
+        'accuratepasspercentage',
+    },
+    'passes': {'passes', 'totalpasses', 'passestotal', 'passesattempted', 'passattempts'},
     'fouls': {'fouls', 'foulscommitted'},
     'yellow_cards': {'yellowcards', 'yellowcard'},
     'yellow_red_cards': {'yellowredcards', 'secondyellowcards'},
@@ -644,11 +659,36 @@ def _empty_team_stats():
     return {key: None for key in STAT_ALIASES.keys()}
 
 
+def _parse_stat_ratio(raw_value):
+    text = str(raw_value or '').strip()
+    match = re.match(r'^(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$', text)
+    if not match:
+        return None
+    try:
+        left = float(match.group(1))
+        right = float(match.group(2))
+        return left, right
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_stat_value(stat_key, raw_value):
+    ratio = _parse_stat_ratio(raw_value)
+    if ratio:
+        left, right = ratio
+        if stat_key == 'pass_accuracy':
+            return round((left / right) * 100, 1) if right else None
+        if stat_key == 'passes':
+            return right if right else left
+        return left
+    return _safe_number(raw_value)
+
+
 def _set_stat(stats, side, raw_name, raw_value):
     normalized = _normalize_stat_name(raw_name)
     for key, aliases in STAT_ALIASES.items():
         if normalized in aliases:
-            stats[side][key] = _safe_number(raw_value)
+            stats[side][key] = _coerce_stat_value(key, raw_value)
             return
 
 
@@ -662,6 +702,22 @@ def _first_present(item, *keys):
 def _extract_match_stats(match):
     stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
 
+    def _ingest_team_stat_block(side, block):
+        if isinstance(block, dict):
+            for key, value in block.items():
+                _set_stat(stats, side, key, value)
+            return
+
+        if not isinstance(block, list):
+            return
+
+        for item in block:
+            if not isinstance(item, dict):
+                continue
+            raw_name = item.get('type') or item.get('name') or item.get('label') or item.get('key')
+            raw_value = _first_present(item, 'value', 'stat', 'amount', 'count')
+            _set_stat(stats, side, raw_name, raw_value)
+
     home_stats = (
         match.get('homeStatistics')
         or match.get('home_stats')
@@ -674,11 +730,8 @@ def _extract_match_stats(match):
         or (match.get('awayTeam') or {}).get('statistics')
         or {}
     )
-    if isinstance(home_stats, dict) or isinstance(away_stats, dict):
-        for key, value in (home_stats or {}).items():
-            _set_stat(stats, 'home', key, value)
-        for key, value in (away_stats or {}).items():
-            _set_stat(stats, 'away', key, value)
+    _ingest_team_stat_block('home', home_stats)
+    _ingest_team_stat_block('away', away_stats)
 
     raw_statistics = match.get('statistics') or match.get('stats') or []
     if isinstance(raw_statistics, dict):
@@ -717,6 +770,8 @@ def _extract_match_stats(match):
         if stats['available']
         else 'The provider has not published advanced statistics for this fixture yet.'
     )
+    if match.get('source'):
+        stats['source'] = match.get('source')
     return stats
 
 
@@ -918,6 +973,129 @@ def _stats_from_thesportsdb(data):
     return stats
 
 
+def _stats_from_api_football(data, match):
+    stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
+    rows = data.get('response') or []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    home_team_id = (match.get('homeTeam') or {}).get('id')
+    away_team_id = (match.get('awayTeam') or {}).get('id')
+    home_team_name = canonical_team_name((match.get('homeTeam') or {}).get('name') or (match.get('homeTeam') or {}).get('shortName'))
+    away_team_name = canonical_team_name((match.get('awayTeam') or {}).get('name') or (match.get('awayTeam') or {}).get('shortName'))
+    accurate_passes = {'home': None, 'away': None}
+
+    def _team_name_matches(left, right):
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        return left in right or right in left
+
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+
+        team = row.get('team') or {}
+        team_id = team.get('id')
+        team_name = canonical_team_name(team.get('name'))
+        if home_team_id is not None and team_id == home_team_id:
+            side = 'home'
+        elif away_team_id is not None and team_id == away_team_id:
+            side = 'away'
+        elif _team_name_matches(team_name, home_team_name):
+            side = 'home'
+        elif _team_name_matches(team_name, away_team_name):
+            side = 'away'
+        elif index == 0:
+            side = 'home'
+        elif index == 1:
+            side = 'away'
+        else:
+            continue
+
+        for item in row.get('statistics') or []:
+            if not isinstance(item, dict):
+                continue
+            stat_type = str(item.get('type') or '').strip()
+            normalized_type = _normalize_stat_name(stat_type)
+            raw_value = item.get('value')
+
+            if normalized_type in {'totalshots', 'shots'}:
+                _set_stat(stats, side, 'shots', raw_value)
+                continue
+
+            if normalized_type in {'shotsongoal', 'shotsontarget'}:
+                _set_stat(stats, side, 'shots_on_target', raw_value)
+                continue
+
+            if normalized_type in {'ballpossession', 'possession'}:
+                _set_stat(stats, side, 'possession', raw_value)
+                continue
+
+            if normalized_type in {'totalpasses', 'passesattempted', 'passattempts', 'totalpass', 'passescompleted', 'passcompleted', 'completedpasses'}:
+                _set_stat(stats, side, 'passes', raw_value)
+                continue
+
+            if 'pass' in normalized_type and ('%' in stat_type or 'accuracy' in normalized_type or 'percentage' in normalized_type):
+                _set_stat(stats, side, 'pass_accuracy', raw_value)
+                continue
+
+            if normalized_type in {'passesaccurate', 'accuratepasses', 'accuratepass', 'accuratepassescount', 'accuratecompletedpasses'}:
+                accurate_passes[side] = _safe_number(raw_value)
+                continue
+
+            if normalized_type in {'passesaccuracy', 'passaccuracy', 'passingaccuracy', 'passcompletion', 'passcompletionrate', 'passsuccessrate', 'passespercentage', 'passespercent', 'passpercentage'}:
+                _set_stat(stats, side, 'pass_accuracy', raw_value)
+
+            if normalized_type == 'passes' and '%' in stat_type:
+                _set_stat(stats, side, 'pass_accuracy', raw_value)
+                continue
+            if normalized_type == 'passes':
+                _set_stat(stats, side, 'passes', raw_value)
+
+    for side in ('home', 'away'):
+        total_passes = stats[side].get('passes')
+        accurate = accurate_passes.get(side)
+        if stats[side].get('pass_accuracy') is None and accurate is not None and total_passes:
+            stats[side]['pass_accuracy'] = round((accurate / total_passes) * 100, 1)
+
+    stats['available'] = any(
+        value is not None
+        for side in ('home', 'away')
+        for value in stats[side].values()
+    )
+    stats['source'] = 'API-FOOTBALL'
+    stats['message'] = 'Match statistics loaded from API-FOOTBALL.'
+    stats['unavailable_fields'] = [
+        key
+        for key in STAT_ALIASES.keys()
+        if stats['home'].get(key) is None and stats['away'].get(key) is None
+    ]
+    logger.info(
+        "API-FOOTBALL stats parsed fixture=%s raw_types=%s home=%s away=%s",
+        match.get('id'),
+        sorted({
+            str(item.get('type') or item.get('name') or item.get('label') or item.get('key') or '')
+            for row in rows if isinstance(row, dict)
+            for item in (row.get('statistics') or []) if isinstance(item, dict)
+        })[:25],
+        {key: stats['home'].get(key) for key in ('possession', 'passes', 'pass_accuracy', 'shots', 'shots_on_target')},
+        {key: stats['away'].get(key) for key in ('possession', 'passes', 'pass_accuracy', 'shots', 'shots_on_target')},
+    )
+    logger.info(
+        "Mapped API-FOOTBALL stats fixture=%s home_possession=%s away_possession=%s home_passes=%s away_passes=%s home_pass_accuracy=%s away_pass_accuracy=%s",
+        match.get('id'),
+        stats['home'].get('possession'),
+        stats['away'].get('possession'),
+        stats['home'].get('passes'),
+        stats['away'].get('passes'),
+        stats['home'].get('pass_accuracy'),
+        stats['away'].get('pass_accuracy'),
+    )
+    return stats
+
+
 def _basic_match_insight_stats(match):
     stats = {'home': _empty_team_stats(), 'away': _empty_team_stats(), 'available': False}
     score = (match.get('score') or {})
@@ -957,7 +1135,7 @@ def _merge_stats(primary, fallback):
         sources.append(primary.get('source') or 'football-data.org')
     if fallback.get('available'):
         sources.append(fallback.get('source') or 'football-data.co.uk')
-    merged['sources'] = sorted(set(filter(Boolean, sources)))
+    merged['sources'] = sorted(set(filter(bool, sources)))
 
     for side in ('home', 'away'):
         for key, value in (fallback.get(side) or {}).items():
@@ -977,7 +1155,7 @@ def _merge_stats(primary, fallback):
     return merged
 
 
-def _stats_diagnostics(match, primary_meta=None, sportsdb_meta=None, fallback_meta=None, fallback_row=None):
+def _stats_diagnostics(match, primary_meta=None, api_football_meta=None, sportsdb_meta=None, fallback_meta=None, fallback_row=None):
     home = match.get('homeTeam') or {}
     away = match.get('awayTeam') or {}
     primary_home_stats = home.get('statistics') or match.get('homeStatistics') or {}
@@ -994,6 +1172,15 @@ def _stats_diagnostics(match, primary_meta=None, sportsdb_meta=None, fallback_me
             'payload_excerpt': (primary_meta or {}).get('payload_excerpt'),
             'home_statistics_keys': list(primary_home_stats.keys()) if isinstance(primary_home_stats, dict) else [],
             'away_statistics_keys': list(primary_away_stats.keys()) if isinstance(primary_away_stats, dict) else [],
+        },
+        'api_football': {
+            'fixture_id': (api_football_meta or {}).get('fixture_id'),
+            'lookup_url': ((api_football_meta or {}).get('fixture_lookup') or {}).get('lookup_url'),
+            'lookup_status': (((api_football_meta or {}).get('fixture_lookup') or {}).get('lookup') or {}).get('status'),
+            'request_url': ((api_football_meta or {}).get('stats_request') or {}).get('url'),
+            'status': ((api_football_meta or {}).get('stats_request') or {}).get('status'),
+            'cache_hit': ((api_football_meta or {}).get('stats_request') or {}).get('cache_hit', False),
+            'error': (api_football_meta or {}).get('error'),
         },
         'football_data_uk': {
             'request_url': (fallback_meta or {}).get('url'),
@@ -1936,30 +2123,156 @@ class UserMatchesView(APIView):
         return Response(payload)
 
 
+def _load_match_detail_by_id(match_id):
+    detail = {}
+    primary_meta = {}
+
+    try:
+        detail, primary_meta = fetch_match(match_id, return_meta=True)
+    except Exception as exc:
+        primary_meta = {'error': str(exc), 'source': 'football-data.org'}
+        logger.exception("Primary match detail provider failed fixture=%s: %s", match_id, exc)
+
+    if not detail:
+        try:
+            matches = fetch_pl_matches(limit=None)
+            detail = next((match for match in matches if str(match.get('id')) == str(match_id)), None)
+        except Exception as exc:
+            logger.exception("Match list fallback failed fixture=%s: %s", match_id, exc)
+
+    return detail, primary_meta
+
+
+def _resolve_match_statistics(detail, match_id, primary_meta=None):
+    primary_meta = primary_meta or {}
+    api_football_meta = {}
+    sportsdb_meta = {}
+    fallback_meta = {}
+    fallback_row = None
+    providers_attempted = []
+    providers_succeeded = []
+
+    primary_stats = _extract_match_stats(detail)
+    provider_stats = primary_stats
+    providers_attempted.append('football-data.org')
+    if primary_stats.get('available'):
+        providers_succeeded.append(primary_stats.get('source') or 'football-data.org')
+
+    try:
+        api_football_data, api_football_meta = fetch_api_football_fixture_stats_for_match(detail, return_meta=True)
+        api_football_stats = _stats_from_api_football(api_football_data, detail) if api_football_data else {'available': False}
+        providers_attempted.append('API-FOOTBALL')
+        provider_stats = _merge_stats(provider_stats, api_football_stats)
+        if api_football_stats.get('available'):
+            providers_succeeded.append('API-FOOTBALL')
+    except Exception as exc:
+        api_football_meta = {'error': str(exc), 'source': 'API-FOOTBALL'}
+        providers_attempted.append('API-FOOTBALL')
+        logger.exception("API-FOOTBALL provider failed fixture=%s: %s", match_id, exc)
+
+    try:
+        sportsdb_data, sportsdb_meta = fetch_thesportsdb_event_stats(detail, return_meta=True)
+        sportsdb_stats = _stats_from_thesportsdb(sportsdb_data) if sportsdb_data else {'available': False}
+        providers_attempted.append('TheSportsDB')
+        provider_stats = _merge_stats(provider_stats, sportsdb_stats)
+        if sportsdb_stats.get('available'):
+            providers_succeeded.append('TheSportsDB')
+    except Exception as exc:
+        sportsdb_meta = {'error': str(exc), 'source': 'TheSportsDB'}
+        providers_attempted.append('TheSportsDB')
+        logger.exception("TheSportsDB provider failed fixture=%s: %s", match_id, exc)
+
+    final_stats = provider_stats
+    try:
+        fallback_rows, fallback_meta = fetch_pl_result_stats(
+            season_start=(detail.get('season') or {}).get('startDate'),
+            return_meta=True,
+        )
+        fallback_row = _match_result_stats_row(detail, fallback_rows)
+        fallback_stats = _stats_from_result_row(fallback_row) if fallback_row else {'available': False}
+        providers_attempted.append('football-data.co.uk')
+        final_stats = _merge_stats(provider_stats, fallback_stats)
+        if fallback_stats.get('available'):
+            providers_succeeded.append('football-data.co.uk')
+        if not final_stats.get('available'):
+            form_stats = _team_form_stats_from_rows(detail, fallback_rows)
+            final_stats = _merge_stats(final_stats, form_stats)
+            if form_stats.get('available'):
+                providers_succeeded.append('team-form-history')
+    except Exception as exc:
+        fallback_meta = {'error': str(exc), 'source': 'football-data.co.uk'}
+        providers_attempted.append('football-data.co.uk')
+        final_stats = provider_stats
+        logger.exception("football-data.co.uk fallback provider failed fixture=%s: %s", match_id, exc)
+
+    if not final_stats.get('available'):
+        basic_stats = _basic_match_insight_stats(detail)
+        final_stats = _merge_stats(final_stats, basic_stats)
+        if basic_stats.get('available'):
+            providers_succeeded.append('match-score')
+
+    final_stats['providers_attempted'] = providers_attempted
+    final_stats['providers_succeeded'] = sorted(set(providers_succeeded))
+    if not final_stats.get('available'):
+        final_stats['message'] = 'Fixture details loaded, but no statistic rows are available for this match yet.'
+        logger.warning(
+            "No advanced stats available fixture=%s providers_attempted=%s api_football_error=%s",
+            match_id,
+            providers_attempted,
+            (api_football_meta or {}).get('error'),
+        )
+
+    diagnostics = _stats_diagnostics(
+        detail,
+        primary_meta,
+        api_football_meta,
+        sportsdb_meta,
+        fallback_meta,
+        fallback_row,
+    )
+
+    return final_stats, diagnostics
+
+
+class UserMatchStatsView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, match_id):
+        detail, primary_meta = _load_match_detail_by_id(match_id)
+        if not detail:
+            return Response(
+                {
+                    'id': match_id,
+                    'stats_loaded_from_detail': False,
+                    'stats': {
+                        'home': _empty_team_stats(),
+                        'away': _empty_team_stats(),
+                        'available': False,
+                        'message': 'Match details are temporarily unavailable. Please retry shortly.',
+                        'providers_attempted': ['football-data.org', 'API-FOOTBALL'],
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        stats_payload, diagnostics = _resolve_match_statistics(detail, match_id, primary_meta=primary_meta)
+        if settings.DEBUG or request.query_params.get('debug') == '1':
+            stats_payload['diagnostics'] = diagnostics
+
+        return Response(
+            {
+                'id': match_id,
+                'stats_loaded_from_detail': True,
+                'stats': stats_payload,
+            }
+        )
+
+
 class UserMatchDetailView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, match_id):
-        detail = {}
-        primary_meta = {}
-        sportsdb_meta = {}
-        fallback_meta = {}
-        fallback_row = None
-        providers_attempted = []
-        providers_succeeded = []
-
-        try:
-            detail, primary_meta = fetch_match(match_id, return_meta=True)
-        except Exception as exc:
-            primary_meta = {'error': str(exc), 'source': 'football-data.org'}
-            logger.exception("Primary match detail provider failed fixture=%s: %s", match_id, exc)
-
-        if not detail:
-            try:
-                matches = fetch_pl_matches(limit=None)
-                detail = next((match for match in matches if str(match.get('id')) == str(match_id)), None)
-            except Exception as exc:
-                logger.exception("Match list fallback failed fixture=%s: %s", match_id, exc)
+        detail, primary_meta = _load_match_detail_by_id(match_id)
 
         if not detail:
             return Response(
@@ -1978,75 +2291,28 @@ class UserMatchDetailView(APIView):
             )
 
         payload = _match_payload(detail)
-        primary_stats = payload.get('stats') or _extract_match_stats(detail)
-        provider_stats = primary_stats
-        providers_attempted.append('football-data.org')
-        if primary_stats.get('available'):
-            providers_succeeded.append('football-data.org')
+        stats_payload, diagnostics = _resolve_match_statistics(detail, match_id, primary_meta=primary_meta)
+        payload['stats'] = stats_payload
 
-        try:
-            sportsdb_data, sportsdb_meta = fetch_thesportsdb_event_stats(detail, return_meta=True)
-            sportsdb_stats = _stats_from_thesportsdb(sportsdb_data) if sportsdb_data else {'available': False}
-            providers_attempted.append('TheSportsDB')
-            provider_stats = _merge_stats(provider_stats, sportsdb_stats)
-            if sportsdb_stats.get('available'):
-                providers_succeeded.append('TheSportsDB')
-        except Exception as exc:
-            sportsdb_meta = {'error': str(exc), 'source': 'TheSportsDB'}
-            providers_attempted.append('TheSportsDB')
-            logger.exception("TheSportsDB provider failed fixture=%s: %s", match_id, exc)
-
-        try:
-            fallback_rows, fallback_meta = fetch_pl_result_stats(
-                season_start=(detail.get('season') or {}).get('startDate'),
-                return_meta=True,
-            )
-            fallback_row = _match_result_stats_row(detail, fallback_rows)
-            fallback_stats = _stats_from_result_row(fallback_row) if fallback_row else {'available': False}
-            providers_attempted.append('football-data.co.uk')
-            payload['stats'] = _merge_stats(provider_stats, fallback_stats)
-            if fallback_stats.get('available'):
-                providers_succeeded.append('football-data.co.uk')
-            if not payload['stats'].get('available'):
-                form_stats = _team_form_stats_from_rows(detail, fallback_rows)
-                payload['stats'] = _merge_stats(payload['stats'], form_stats)
-                if form_stats.get('available'):
-                    providers_succeeded.append('team-form-history')
-        except Exception as exc:
-            fallback_meta = {'error': str(exc), 'source': 'football-data.co.uk'}
-            providers_attempted.append('football-data.co.uk')
-            payload['stats'] = provider_stats
-            logger.exception("football-data.co.uk fallback provider failed fixture=%s: %s", match_id, exc)
-
-        if not payload.get('stats', {}).get('available'):
-            basic_stats = _basic_match_insight_stats(detail)
-            payload['stats'] = _merge_stats(payload.get('stats') or provider_stats, basic_stats)
-            if basic_stats.get('available'):
-                providers_succeeded.append('match-score')
-
-        payload['stats']['providers_attempted'] = providers_attempted
-        payload['stats']['providers_succeeded'] = sorted(set(providers_succeeded))
-        if not payload['stats'].get('available'):
-            payload['stats']['message'] = 'Fixture details loaded, but no statistic rows are available for this match yet.'
-
-        diagnostics = _stats_diagnostics(detail, primary_meta, sportsdb_meta, fallback_meta, fallback_row)
         if settings.DEBUG or request.query_params.get('debug') == '1':
             payload['stats']['diagnostics'] = diagnostics
         payload['stats_loaded_from_detail'] = True
         logger.info(
-            "Match stats debug fixture=%s attempted=%s succeeded=%s final_available=%s primary_url=%s primary_status=%s primary_home_keys=%s primary_away_keys=%s sportsdb_stats_url=%s sportsdb_status=%s fallback_url=%s fallback_status=%s fallback_row=%s",
+            "Match stats debug fixture=%s attempted=%s succeeded=%s final_available=%s primary_url=%s primary_status=%s api_football_url=%s api_football_status=%s primary_home_keys=%s primary_away_keys=%s sportsdb_stats_url=%s sportsdb_status=%s fallback_url=%s fallback_status=%s fallback_row=%s",
             match_id,
-            providers_attempted,
-            providers_succeeded,
+            payload['stats'].get('providers_attempted'),
+            payload['stats'].get('providers_succeeded'),
             payload['stats'].get('available'),
             primary_meta.get('url'),
             primary_meta.get('status'),
+            diagnostics['api_football']['request_url'],
+            diagnostics['api_football']['status'],
             diagnostics['football_data_org']['home_statistics_keys'],
             diagnostics['football_data_org']['away_statistics_keys'],
             diagnostics['thesportsdb']['stats_request_url'],
             diagnostics['thesportsdb']['stats_request_status'],
-            fallback_meta.get('url'),
-            fallback_meta.get('status'),
+            diagnostics['football_data_uk']['request_url'],
+            diagnostics['football_data_uk']['status'],
             diagnostics['football_data_uk']['matched_row'],
             )
         return Response(payload)

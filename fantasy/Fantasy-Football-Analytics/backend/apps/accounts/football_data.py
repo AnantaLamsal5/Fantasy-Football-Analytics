@@ -1,6 +1,7 @@
 import json
 import logging
 import csv
+import hashlib
 from datetime import datetime
 from io import StringIO
 from urllib import parse, request
@@ -13,6 +14,7 @@ from django.core.cache import cache
 
 BASE_URL = 'https://api.football-data.org/v4'
 THESPORTSDB_BASE_URL = 'https://www.thesportsdb.com/api/v1/json'
+API_FOOTBALL_BASE_URL = 'https://v3.football.api-sports.io'
 logger = logging.getLogger(__name__)
 
 
@@ -116,9 +118,122 @@ def fetch_pl_matches(limit=20, status=None):
         query['status'] = status
     data = fetch_json('/competitions/PL/matches', query, cache_timeout=120)
     matches = data.get('matches', [])
+    if not matches:
+        matches = _fallback_matches_from_result_stats(status=status)
     if limit is None:
         return matches
     return matches[:limit]
+
+
+def _optional_int(value):
+    if value in ('', None):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_row_datetime(row):
+    raw_date = row.get('Date')
+    if not raw_date:
+        return None
+
+    parsed_date = None
+    for date_format in ('%d/%m/%Y', '%d/%m/%y'):
+        try:
+            parsed_date = datetime.strptime(raw_date, date_format)
+            break
+        except ValueError:
+            continue
+    if not parsed_date:
+        return None
+
+    raw_time = row.get('Time') or '15:00'
+    for time_format in ('%H:%M', '%H:%M:%S'):
+        try:
+            parsed_time = datetime.strptime(raw_time, time_format).time()
+            parsed_date = parsed_date.replace(hour=parsed_time.hour, minute=parsed_time.minute)
+            break
+        except ValueError:
+            continue
+
+    return parsed_date
+
+
+def _result_row_id(row):
+    raw = '|'.join(str(row.get(key) or '') for key in ('Date', 'Time', 'HomeTeam', 'AwayTeam'))
+    digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]
+    return int(digest, 16)
+
+
+def _result_row_season(kickoff):
+    if not kickoff:
+        return {'startDate': None, 'endDate': None}
+    start_year = kickoff.year if kickoff.month >= 7 else kickoff.year - 1
+    return {
+        'startDate': datetime(start_year, 8, 1).date().isoformat(),
+        'endDate': datetime(start_year + 1, 5, 31).date().isoformat(),
+    }
+
+
+def _result_row_stats(row, side):
+    prefix = 'H' if side == 'home' else 'A'
+    return {
+        'Full time goals': _optional_int(row.get(f'{prefix}G') or row.get(f'FT{prefix}G')),
+        'Half time goals': _optional_int(row.get(f'HT{prefix}G')),
+        'Total shots': _optional_int(row.get(f'{prefix}S')),
+        'Shots on target': _optional_int(row.get(f'{prefix}ST')),
+        'Fouls': _optional_int(row.get(f'{prefix}F')),
+        'Corners': _optional_int(row.get(f'{prefix}C')),
+        'Yellow cards': _optional_int(row.get(f'{prefix}Y')),
+        'Red cards': _optional_int(row.get(f'{prefix}R')),
+    }
+
+
+def _result_row_to_match(row):
+    kickoff = _result_row_datetime(row)
+    home_goals = _optional_int(row.get('FTHG'))
+    away_goals = _optional_int(row.get('FTAG'))
+    home_half = _optional_int(row.get('HTHG'))
+    away_half = _optional_int(row.get('HTAG'))
+    result = row.get('FTR')
+    winner = 'DRAW' if result == 'D' else ('HOME_TEAM' if result == 'H' else ('AWAY_TEAM' if result == 'A' else None))
+
+    return {
+        'id': _result_row_id(row),
+        'utcDate': kickoff.isoformat() + 'Z' if kickoff else None,
+        'status': 'FINISHED',
+        'matchday': _optional_int(row.get('MW') or row.get('Round')),
+        'competition': {'name': 'Premier League', 'code': 'PL'},
+        'season': _result_row_season(kickoff),
+        'homeTeam': {
+            'name': row.get('HomeTeam'),
+            'shortName': row.get('HomeTeam'),
+        },
+        'awayTeam': {
+            'name': row.get('AwayTeam'),
+            'shortName': row.get('AwayTeam'),
+        },
+        'score': {
+            'winner': winner,
+            'duration': 'REGULAR',
+            'fullTime': {'home': home_goals, 'away': away_goals},
+            'halfTime': {'home': home_half, 'away': away_half},
+        },
+        'home_stats': _result_row_stats(row, 'home'),
+        'away_stats': _result_row_stats(row, 'away'),
+        'source': 'football-data.co.uk',
+    }
+
+
+def _fallback_matches_from_result_stats(status=None):
+    if status and status.upper() not in {'FINISHED'}:
+        return []
+    rows = fetch_pl_result_stats()
+    matches = [_result_row_to_match(row) for row in rows]
+    matches.sort(key=lambda match: match.get('utcDate') or '', reverse=True)
+    return matches
 
 
 def fetch_match(match_id, return_meta=False):
@@ -246,7 +361,7 @@ def fetch_pl_result_stats(season_start=None, return_meta=False):
     return ([], meta) if return_meta else []
 
 
-def _fetch_external_json(url, cache_key, cache_timeout, source):
+def _fetch_external_json(url, cache_key, cache_timeout, source, headers=None):
     stale_key = f"{cache_key}:stale"
     cached = cache.get(cache_key)
     meta = {'url': url, 'status': None, 'cache_hit': False, 'source': source}
@@ -255,7 +370,10 @@ def _fetch_external_json(url, cache_key, cache_timeout, source):
         meta['cache_hit'] = True
         return cached, meta
 
-    req = request.Request(url, headers={'User-Agent': 'FantasyFootballAnalytics/1.0'})
+    req_headers = {'User-Agent': 'FantasyFootballAnalytics/1.0'}
+    if headers:
+        req_headers.update(headers)
+    req = request.Request(url, headers=req_headers)
     try:
         payload = ''
         for attempt in range(2):
@@ -387,6 +505,184 @@ def fetch_thesportsdb_event_stats(match, return_meta=False):
         },
     }
     return (stats_data, meta) if return_meta else stats_data
+
+
+def _api_football_key():
+    return getattr(settings, 'API_FOOTBALL_API_KEY', '') or ''
+
+
+def _api_football_url(path, query=None):
+    query = query or {}
+    encoded = parse.urlencode(query)
+    if encoded:
+        return f"{API_FOOTBALL_BASE_URL}{path}?{encoded}"
+    return f"{API_FOOTBALL_BASE_URL}{path}"
+
+
+def _api_football_headers():
+    return {
+        'x-apisports-key': _api_football_key(),
+        'Accept': 'application/json',
+    }
+
+
+def _api_football_match_date(match):
+    kickoff = match.get('utcDate') or match.get('kickoff')
+    if not kickoff:
+        return ''
+    return str(kickoff)[:10]
+
+
+def _api_football_match_season(match):
+    start_date = (match.get('season') or {}).get('startDate')
+    if start_date:
+        try:
+            return int(str(start_date)[:4])
+        except (TypeError, ValueError):
+            pass
+    date_part = _api_football_match_date(match)
+    if len(date_part) >= 4:
+        try:
+            return int(date_part[:4])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _api_football_fixture_matches(match, fixture_row):
+    fixture = (fixture_row or {}).get('fixture') or {}
+    teams = (fixture_row or {}).get('teams') or {}
+    home = teams.get('home') or {}
+    away = teams.get('away') or {}
+
+    home_name = canonical_team_name((match.get('homeTeam') or {}).get('name') or (match.get('homeTeam') or {}).get('shortName'))
+    away_name = canonical_team_name((match.get('awayTeam') or {}).get('name') or (match.get('awayTeam') or {}).get('shortName'))
+    api_home_name = canonical_team_name(home.get('name'))
+    api_away_name = canonical_team_name(away.get('name'))
+
+    def _name_matches(left, right):
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        return left in right or right in left
+
+    if not _name_matches(home_name, api_home_name) or not _name_matches(away_name, api_away_name):
+        return False
+
+    match_date = _api_football_match_date(match)
+    fixture_date = str(fixture.get('date') or '')[:10]
+    if match_date and fixture_date and match_date != fixture_date:
+        return False
+
+    return True
+
+
+def resolve_api_football_fixture_id(match, return_meta=False):
+    api_key = _api_football_key()
+    if not api_key:
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_api_key'}
+        return (None, meta) if return_meta else None
+
+    match_date = _api_football_match_date(match)
+    season = _api_football_match_season(match)
+    if not match_date:
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_match_date'}
+        return (None, meta) if return_meta else None
+
+    query = {'date': match_date, 'league': 39}
+    if season:
+        query['season'] = season
+
+    cache_timeout = int(getattr(settings, 'API_FOOTBALL_STATS_CACHE_SECONDS', 6 * 60 * 60))
+    lookup_url = _api_football_url('/fixtures', query)
+    cache_key = f"api-football:fixtures:{match_date}:{season or 'na'}:{canonical_team_name((match.get('homeTeam') or {}).get('name') or (match.get('homeTeam') or {}).get('shortName'))}:{canonical_team_name((match.get('awayTeam') or {}).get('name') or (match.get('awayTeam') or {}).get('shortName'))}"
+
+    data, lookup_meta = _fetch_external_json(
+        lookup_url,
+        cache_key,
+        cache_timeout,
+        'API-FOOTBALL',
+        headers=_api_football_headers(),
+    )
+    rows = data.get('response') or []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    matched = next((row for row in rows if _api_football_fixture_matches(match, row)), None)
+    fixture_id = ((matched or {}).get('fixture') or {}).get('id')
+    meta = {
+        'source': 'API-FOOTBALL',
+        'lookup_url': lookup_url,
+        'lookup': lookup_meta,
+        'searched_count': len(rows),
+        'resolved_fixture_id': fixture_id,
+        'match_date': match_date,
+        'season': season,
+    }
+    if not fixture_id:
+        logger.warning(
+            "API-FOOTBALL fixture resolution failed date=%s season=%s home=%s away=%s searched=%s",
+            match_date,
+            season,
+            (match.get('homeTeam') or {}).get('name') or (match.get('homeTeam') or {}).get('shortName'),
+            (match.get('awayTeam') or {}).get('name') or (match.get('awayTeam') or {}).get('shortName'),
+            len(rows),
+        )
+    else:
+        logger.info("API-FOOTBALL resolved fixture_id=%s for date=%s", fixture_id, match_date)
+    return (fixture_id, meta) if return_meta else fixture_id
+
+
+def fetch_api_football_fixture_stats(fixture_id, return_meta=False):
+    fixture = str(fixture_id or '').strip()
+    if not fixture:
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_fixture_id'}
+        return ({}, meta) if return_meta else {}
+
+    if not _api_football_key():
+        meta = {'source': 'API-FOOTBALL', 'error': 'missing_api_key'}
+        return ({}, meta) if return_meta else {}
+
+    cache_timeout = int(getattr(settings, 'API_FOOTBALL_STATS_CACHE_SECONDS', 6 * 60 * 60))
+    url = _api_football_url('/fixtures/statistics', {'fixture': fixture})
+    logger.info("API-FOOTBALL requesting fixture statistics fixture_id=%s", fixture)
+    data, meta = _fetch_external_json(
+        url,
+        f"api-football:fixture-stats:{fixture}",
+        cache_timeout,
+        'API-FOOTBALL',
+        headers=_api_football_headers(),
+    )
+    response_rows = data.get('response') if isinstance(data, dict) else None
+    meta['response_count'] = len(response_rows) if isinstance(response_rows, list) else 0
+    logger.info(
+        "API-FOOTBALL stats raw fixture_id=%s response_count=%s first_row_keys=%s",
+        fixture,
+        meta['response_count'],
+        list(response_rows[0].keys()) if isinstance(response_rows, list) and response_rows and isinstance(response_rows[0], dict) else [],
+    )
+    return (data, meta) if return_meta else data
+
+
+def fetch_api_football_fixture_stats_for_match(match, return_meta=False):
+    fixture_id, fixture_meta = resolve_api_football_fixture_id(match, return_meta=True)
+    if not fixture_id:
+        meta = {
+            'source': 'API-FOOTBALL',
+            'error': 'fixture_not_resolved',
+            'fixture_lookup': fixture_meta,
+        }
+        return ({}, meta) if return_meta else {}
+
+    data, stats_meta = fetch_api_football_fixture_stats(fixture_id, return_meta=True)
+    meta = {
+        'source': 'API-FOOTBALL',
+        'fixture_id': fixture_id,
+        'fixture_lookup': fixture_meta,
+        'stats_request': stats_meta,
+    }
+    return (data, meta) if return_meta else data
 
 
 def fetch_pl_teams():

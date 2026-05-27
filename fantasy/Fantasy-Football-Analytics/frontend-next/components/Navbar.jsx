@@ -12,6 +12,7 @@ import { getNotifications, markAllNotificationsRead, markNotificationRead } from
 const links = [ 
   { href: APP_ROUTES.dashboard, label: "Dashboard" },
   { href: APP_ROUTES.team, label: "Team" },
+  { href: APP_ROUTES.matches, label: "Matches" },
   { href: APP_ROUTES.transfers, label: "Transfers" },
   { href: APP_ROUTES.leaderboard, label: "Leaderboard" },
   { href: APP_ROUTES.predictions, label: "AI Predictions" },
@@ -33,6 +34,7 @@ export default function Navbar() {
 
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const profileDropdownRef = useRef(null);
   const notificationDropdownRef = useRef(null);
@@ -53,6 +55,10 @@ export default function Navbar() {
     }
     return undefined;
   }, [showProfileMenu, showNotifications]);
+
+  useEffect(() => {
+    setShowMobileMenu(false);
+  }, [pathname]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -81,6 +87,7 @@ export default function Navbar() {
   function handleLogout() {
     setShowProfileMenu(false);
     setShowNotifications(false);
+    setShowMobileMenu(false);
     setNotifications([]);
     logout();
   }
@@ -98,6 +105,18 @@ export default function Navbar() {
   }
 
   const unreadCount = notifications.filter((item) => !item.read).length;
+  const protectedRoutes = [
+    APP_ROUTES.dashboard,
+    APP_ROUTES.team,
+    APP_ROUTES.matches,
+    APP_ROUTES.transfers,
+    APP_ROUTES.leaderboard,
+    APP_ROUTES.predictions,
+  ];
+  const visibleLinks = [...links, ...(user?.role === "admin" ? adminLinks : [])].filter((item) => {
+    if (isAuthenticated) return true;
+    return !protectedRoutes.includes(item.href);
+  });
 
   if (isAdminRoute) {
     return null;
@@ -125,19 +144,7 @@ export default function Navbar() {
 
         <div className="flex flex-1 items-center justify-between space-x-2 md:justify-end">
           <nav className="hidden md:flex items-center md:space-x-4 lg:space-x-6 text-sm font-medium">
-            {[...links, ...(user?.role === "admin" ? adminLinks : [])]
-              .filter((item) => {
-                if (isAuthenticated) return true;
-                // Hide protected routes if not authenticated
-                const protectedRoutes = [
-                  APP_ROUTES.dashboard,
-                  APP_ROUTES.team,
-                  APP_ROUTES.transfers,
-                  APP_ROUTES.leaderboard,
-                  APP_ROUTES.predictions
-                ];
-                return !protectedRoutes.includes(item.href);
-              })
+            {visibleLinks
               .map((item) => {
                 const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
                 return (
@@ -285,6 +292,7 @@ export default function Navbar() {
               </>
             )}
             <button
+              onClick={() => setShowMobileMenu((prev) => !prev)}
               className="md:hidden flex items-center justify-center rounded-md w-9 h-9 border border-input bg-background/70 hover:bg-background/75 smooth-transition"
               aria-label="Open menu"
               type="button"
@@ -294,6 +302,48 @@ export default function Navbar() {
           </div>
         </div>
       </div>
+      {showMobileMenu ? (
+        <div className="md:hidden border-t border-border/30 bg-background/95">
+          <div className="container mx-auto px-4 py-3">
+            {isAuthenticated ? (
+              <div className="flex flex-col gap-1">
+                {visibleLinks.map((item) => {
+                  const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
+                  return (
+                    <Link
+                      key={`mobile-${item.href}`}
+                      href={item.href}
+                      onClick={() => setShowMobileMenu(false)}
+                      className={`rounded-md px-3 py-2 text-sm font-medium ${
+                        isActive ? "text-foreground bg-muted/40" : "text-foreground/80 hover:text-foreground hover:bg-muted/30"
+                      }`}
+                    >
+                      {item.label}
+                    </Link>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <Link
+                  href={APP_ROUTES.login}
+                  onClick={() => setShowMobileMenu(false)}
+                  className="rounded-md border border-input bg-background/70 px-3 py-2 text-sm font-medium hover:bg-background/75"
+                >
+                  Log in
+                </Link>
+                <Link
+                  href={APP_ROUTES.signup}
+                  onClick={() => setShowMobileMenu(false)}
+                  className="btn-primary inline-flex h-9 items-center justify-center"
+                >
+                  Sign up
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
     </nav>
   );
 }
